@@ -1,0 +1,55 @@
+# services.yaml — home services managed on Pangolin (org: aldervall)
+#
+# Apply idempotently with:
+#   ./bin/pango apply-services services.yaml            # live API
+#   ./bin/pango apply-services services.yaml --mock     # against the mock
+#   ./bin/pango apply-services services.yaml --dry-run  # print the curls
+#
+# Idempotency rule: services are matched by `full-domain`. If a resource with
+# that fullDomain already exists, apply-services only reconciles TARGETS
+# (adds missing ones) — it NEVER creates a duplicate resource.
+#
+# Schema (per service):
+#   name          (required) display name of the public resource
+#   full-domain   (required) the exact FQDN (e.g. hs.aldervall.se); used as
+#                 the idempotency key and must equal subdomain.baseDomain
+#   subdomain     (optional) subdomain part; derived from full-domain if omitted
+#   domain-id     (optional) the domain to attach to; auto-looked-up by
+#                 baseDomain (wildcard type preferred) when omitted
+#   mode          (optional) http|ssh|rdp|vnc|tcp|udp (default: http)
+#   targets       (required) one or more targets:
+#       site        (required) site NAME (resolved to siteId via list sites)
+#       hostname    (required) target IP/hostname
+#       port        (required) target port
+#       method      (optional) http default
+#   auth:         (optional) access grants:
+#       sso-enabled (optional) true -> assign the default role afterwards
+#   healthcheck   (optional, consumed by `pango apply-healthchecks`, Todo 9):
+#       interval    (optional) seconds between checks
+#       timeout     (optional) seconds until a check fails
+#       retries     (optional) consecutive failures before marking unhealthy
+
+services:
+  - name: Home Assistant
+    full-domain: hs.aldervall.se
+    domain-id: dg-aldervall
+    mode: http
+    targets:
+      - site: home-nuc
+        hostname: 100.90.128.2
+        port: 8123
+        method: http
+    healthcheck:
+      interval: 60
+      timeout: 10
+      retries: 3
+
+  - name: Bitwarden
+    full-domain: bw.aldervall.se
+    domain-id: dg-aldervall
+    mode: http
+    targets:
+      - site: home-nuc
+        hostname: 100.90.128.2
+        port: 8080
+        method: http

@@ -110,6 +110,19 @@ list_entities() { # <entity-key> <status-message>
   envelope "$data" true false "$msg" 200
 }
 
+list_targets() { # GET /resource/{id}/targets — only targets of that resource
+  local rid limit offset data
+  rid="$(sed -E 's#^/resource/([0-9]+)/targets$#\1#' <<<"$PATH_ARG")"
+  limit="$(qparam limit 1000)"
+  offset="$(qparam offset 0)"
+  data="$(jq -c --argjson rid "$rid" --argjson limit "$limit" --argjson offset "$offset" \
+    '[.targets[] | select(.resourceId == $rid)] as $all |
+     {targets: $all[($offset):($offset + $limit)],
+      pagination: {total: ($all | length), limit: $limit, offset: $offset}}' \
+    "$STATE_FILE")"
+  envelope "$data" true false "Targets retrieved successfully" 200
+}
+
 create_site() {
   local name type address newtId secret newid data
   name="$(jq -r '.name // empty' <<<"$BODY")"
@@ -231,7 +244,7 @@ main() {
     "GET /org/"*"/clients")             list_entities clients "Clients retrieved successfully" ;;
     "GET /org/"*"/users")               list_entities users "Users retrieved successfully" ;;
     "GET /org/"*"/roles")               list_entities roles "Roles retrieved successfully" ;;
-    "GET /resource/"*"/targets")        list_entities targets "Targets retrieved successfully" ;;
+    "GET /resource/"*"/targets")        list_targets ;;
     "GET /org/"*"/pick-site-defaults")  pick_site_defaults ;;
     "PUT /org/"*"/site")                create_site ;;
     "PUT /org/"*"/resource")            create_resource ;;

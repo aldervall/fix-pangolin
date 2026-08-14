@@ -51,6 +51,9 @@ Commands:
   assign <rid>           Grant access (--role <id> or --user <id>, exactly one)
   apply-blueprint <file|b64>  Apply a blueprint (JSON file base64-encoded, or a
                          pre-encoded base64 payload)
+  apply-services <yaml>  Idempotent apply of services.yaml (default: services.yaml);
+                         matches resources by full-domain; reconciles targets;
+                         auto-looks-up domain by baseDomain and site by name
   help                   Show this help
 
 Flags:
@@ -147,21 +150,14 @@ render_table() {
 }
 
 # --- commands ---------------------------------------------------------------
-# do_list <entity-key> <path> <field1> <field2> ...
-#   loops limit/offset pages until pagination.total is consumed, then renders
-do_list() {
+# collect_all <entity-key> <path> — echoes a JSON array with all pages fetched
+collect_all() {
   local key="$1" path="$2"
-  shift 2
-  local page_size="${PANGOLIN_PAGE_SIZE:-1000}"
-  local offset=0 total=1
+  local page_size="${PANGOLIN_PAGE_SIZE:-1000}" offset=0 total=1
   local resp rows collected='[]' sep
 
   while (( offset < total )); do
     if [[ "$path" == *\?* ]]; then sep='&'; else sep='?'; fi
-    if [[ "$DRY_RUN" == 1 ]]; then
-      api_call GET "${path}${sep}limit=${page_size}&offset=${offset}"
-      return 0
-    fi
     resp="$(api_call GET "${path}${sep}limit=${page_size}&offset=${offset}")" || {
       echo "error: API call failed" >&2
       exit 1
@@ -173,8 +169,22 @@ do_list() {
     offset=$(( offset + page_size ))
   done
 
-  local wrapped
-  wrapped="$(jq -n --arg key "$key" --argjson items "$collected" \
+  printf '%s' "$collected"
+}
+
+# do_list <entity-key> <path> <field1> <field2> ...
+#   loops limit/offset pages until pagination.total is consumed, then renders
+do_list() {
+  local key="$1" path="$2"
+  shift 2
+  if [[ "$DRY_RUN" == 1 ]]; then
+    local sep='?'; [[ "$path" == *\?* ]] && sep='&'
+    api_call GET "${path}${sep}limit=${PANGOLIN_PAGE_SIZE:-1000}&offset=0"
+    return 0
+  fi
+  local items wrapped
+  items="$(collect_all "$key" "$path")"
+  wrapped="$(jq -n --arg key "$key" --argjson items "$items" \
     '{data: {($key): $items, pagination: {total: ($items | length)}}}')"
   render_table "$wrapped" "$key" "$@"
 }
@@ -205,20 +215,51 @@ cmd_list() {
 }
 
 # --- write commands ----------------------------------------------------------
-# do_write <method> <path> <body> — guard dry-run, call, surface envelope
-do_write() {
-  local method="$1" path="$2" body="$3"
+# run_write <method> <path> <body> — interactive write:
+#   dry-run: print exact curl via api_call and exit 0
+#   live:    execute, surface envelope, print "OK: <message>"
+run_write() {
+  local method="$1" path="$2" body="$3" resp
   if [[ "$DRY_RUN" == 1 ]]; then
     api_call "$method" "$path" "$body"
     return 0
   fi
-  local resp
   resp="$(api_call "$method" "$path" "$body")" || {
     echo "error: API call failed" >&2
     exit 1
   }
   check_envelope "$resp"
   jq -r '"OK: " + (.message // "success")' <<<"$resp"
+}
+
+# do_write <method> <path> <body> — like run_write but echoes the raw response
+#   JSON instead of the message (for callers that need ids for idempotency).
+#   dry-run: prints the exact curl and returns 0 WITHOUT echoing JSON.
+do_write() {
+  local method="$1" path="$2" body="$3" resp
+  if [[ "$DRY_RUN" == 1 ]]; then
+    api_call "$method" "$path" "$body"
+    return 0
+  fi
+  resp="$(api_call "$method" "$path" "$body")" || {
+    echo "error: API call failed" >&2
+    exit 1
+  }
+  check_envelope "$resp"
+  printf '%s\n' "$resp"
+}
+
+# envelope_ok <response-json> — like check_envelope but returns instead of exits
+envelope_ok() {
+  local resp="$1" error status message
+  error="$(jq -r '.error // false' <<<"$resp")"
+  status="$(jq -r '.status // 0' <<<"$resp")"
+  message="$(jq -r '.message // ""' <<<"$resp")"
+  if [[ "$error" == "true" || "$status" -ge 400 ]]; then
+    echo "API error ($status): $message" >&2
+    return 1
+  fi
+  return 0
 }
 
 cmd_create_site() {
@@ -234,7 +275,7 @@ cmd_create_site() {
         --arg address '<from-pick-site-defaults>' --arg newtId '<from-pick-site-defaults>' \
         --arg secret '<from-pick-site-defaults>' \
         '{name:$name, type:$type, address:$address, newtId:$newtId, secret:$secret}')"
-      do_write PUT "/org/$PANGOLIN_ORG_ID/site" "$body"
+      run_write PUT "/org/$PANGOLIN_ORG_ID/site" "$body"
       return 0
     fi
     dresp="$(api_call GET "/org/$PANGOLIN_ORG_ID/pick-site-defaults")" || exit 1
@@ -245,12 +286,12 @@ cmd_create_site() {
     body="$(jq -n --arg name "$name" --arg type "$type" \
       --arg address "$addr" --arg newtId "$nt" --arg secret "$sec" \
       '{name:$name, type:$type, address:$address, newtId:$newtId, secret:$secret}')"
-    do_write PUT "/org/$PANGOLIN_ORG_ID/site" "$body"
+    run_write PUT "/org/$PANGOLIN_ORG_ID/site" "$body"
     return 0
   fi
 
   body="$(jq -n --arg name "$name" --arg type "$type" '{name:$name, type:$type}')"
-  do_write PUT "/org/$PANGOLIN_ORG_ID/site" "$body"
+  run_write PUT "/org/$PANGOLIN_ORG_ID/site" "$body"
 }
 
 cmd_create_resource() {
@@ -262,7 +303,7 @@ cmd_create_resource() {
   body="$(jq -n --arg name "$name" --arg domainId "$domain_id" \
     --arg subdomain "$subdomain" --arg mode "$mode" \
     '{name:$name, domainId:$domainId, mode:$mode, subdomain:$subdomain}')"
-  do_write PUT "/org/$PANGOLIN_ORG_ID/resource" "$body"
+  run_write PUT "/org/$PANGOLIN_ORG_ID/resource" "$body"
 }
 
 cmd_add_target() {
@@ -275,7 +316,7 @@ cmd_add_target() {
 
   body="$(jq -n --argjson siteId "$site_id" --arg ip "$ip" --argjson port "$port" \
     --arg method "$method" '{siteId:$siteId, ip:$ip, port:$port, method:$method}')"
-  do_write PUT "/resource/$rid/target" "$body"
+  run_write PUT "/resource/$rid/target" "$body"
 }
 
 cmd_assign() {
@@ -287,10 +328,10 @@ cmd_assign() {
   if [[ -n "$role" ]]; then
     [[ "$role" =~ ^[0-9]+$ ]] || { echo "error: --role must be numeric" >&2; exit 2; }
     body="$(jq -n --argjson roleId "$role" '{roleId:$roleId}')"
-    do_write POST "/resource/$rid/roles/add" "$body"
+    run_write POST "/resource/$rid/roles/add" "$body"
   elif [[ -n "$user" ]]; then
     body="$(jq -n --arg userId "$user" '{userId:$userId}')"
-    do_write POST "/resource/$rid/users/add" "$body"
+    run_write POST "/resource/$rid/users/add" "$body"
   else
     echo "error: assign requires --role <id> or --user <id>" >&2; exit 2
   fi
@@ -308,7 +349,215 @@ cmd_apply_blueprint() {
     blueprint="$payload"
   fi
   body="$(jq -n --arg blueprint "$blueprint" '{blueprint:$blueprint}')"
-  do_write PUT "/org/$PANGOLIN_ORG_ID/blueprint" "$body"
+  run_write PUT "/org/$PANGOLIN_ORG_ID/blueprint" "$body"
+}
+
+# yaml_to_json <file> — YAML -> JSON via yq or python3+PyYAML
+yaml_to_json() {
+  local file="$1"
+  if command -v yq >/dev/null 2>&1; then
+    yq e -o=json '.' "$file" 2>/dev/null && return 0
+  fi
+  if command -v python3 >/dev/null 2>&1 && python3 -c 'import yaml' 2>/dev/null; then
+    python3 - "$file" <<'PYEOF'
+import sys, json, yaml
+with open(sys.argv[1]) as f:
+    print(json.dumps(yaml.safe_load(f)))
+PYEOF
+    return 0
+  fi
+  echo "error: services.yaml needs yq or python3+PyYAML for YAML parsing" >&2
+  return 1
+}
+
+# cmd_apply_services <services.yaml> — idempotent by full-domain:
+#   resource exists -> reconcile targets (add missing, never duplicate)
+#   resource missing -> create resource then add targets
+cmd_apply_services() {
+  local file="${1:-services.yaml}"
+  [[ -f "$file" ]] || { echo "error: services file not found: $file" >&2; exit 2; }
+
+  local svcs
+  svcs="$(yaml_to_json "$file")" || exit 2
+  svcs="$(jq -c 'if type == "array" then . elif .services then .services else [.] end' <<<"$svcs")"
+
+  local sites domains resources
+  if [[ "$DRY_RUN" == 1 ]]; then
+    # dry-run cannot resolve live state; empty arrays let the loop
+    # print write curls with <placeholder> ids instead of failing
+    sites='[]'; domains='[]'; resources='[]'
+    api_call GET "/org/$PANGOLIN_ORG_ID/sites?limit=1000&offset=0"
+    api_call GET "/org/$PANGOLIN_ORG_ID/domains?limit=1000&offset=0"
+    api_call GET "/org/$PANGOLIN_ORG_ID/resources?limit=1000&offset=0"
+    echo "# apply-services dry-run: prints each write curl below"
+  else
+    sites="$(collect_all sites "/org/$PANGOLIN_ORG_ID/sites")"
+    domains="$(collect_all domains "/org/$PANGOLIN_ORG_ID/domains")"
+    resources="$(collect_all resources "/org/$PANGOLIN_ORG_ID/resources")"
+  fi
+
+  local n i
+  n="$(jq 'length' <<<"$svcs")"
+  local created=0 updated=0 skipped=0 failed=0
+
+  for (( i=0; i<n; i++ )); do
+    local svc name full_domain domain_id subdomain mode
+    svc="$(jq -c --argjson i "$i" '.[$i]' <<<"$svcs")"
+    name="$(jq -r '.name // empty' <<<"$svc")"
+    full_domain="$(jq -r '."full-domain" // empty' <<<"$svc")"
+    if [[ -z "$name" || -z "$full_domain" ]]; then
+      echo "SKIP  service #$((i+1)): missing name or full-domain"
+      skipped=$((skipped+1)); continue
+    fi
+
+    # resolve domain-id: explicit, else auto-lookup by baseDomain suffix.
+    # NOTE: bind .baseDomain via `as $b` BEFORE the pipe — jq evaluates a
+    # function-call argument in the context of the piped input ($fd, a string),
+    # so `.baseDomain` inside endswith() there would index a string (fatal in jq>=1.8).
+    domain_id="$(jq -r '."domain-id" // empty' <<<"$svc")"
+    if [[ -z "$domain_id" ]]; then
+      domain_id="$(jq -n -r --argjson data "$domains" --arg fd "$full_domain" '
+        [$data[] | select(has("baseDomain") and (.baseDomain as $b |
+          ($fd | endswith("." + $b)) or ($fd == $b)))]
+        | if length == 0 then "" else ((map(select(has("type") and .type == "wildcard"))[0]) // (.[0])).domainId end')"
+    fi
+    if [[ -z "$domain_id" ]]; then
+      if [[ "$DRY_RUN" == 1 ]]; then
+        domain_id="<domain-id-for:$full_domain>"
+      else
+        echo "FAIL  $name: no domain matches $full_domain (set domain-id)" >&2
+        failed=$((failed+1)); continue
+      fi
+    fi
+
+    # subdomain: explicit, else derived from full-domain minus baseDomain
+    subdomain="$(jq -r '.subdomain // empty' <<<"$svc")"
+    if [[ -z "$subdomain" && "$DRY_RUN" != 1 ]]; then
+      subdomain="$(jq -n -r --argjson data "$domains" --arg fd "$full_domain" --arg d "$domain_id" '
+        (([$data[] | select(has("domainId") and .domainId == $d)][0].baseDomain) // "") as $bd
+        | if $bd != "" and ($fd | endswith("." + $bd)) then $fd | rtrimstr("." + $bd) else "" end')"
+    fi
+
+    # pre-validate targets before any writes (avoid orphan resources when a
+    # site name is unknown — the resource would otherwise be created first)
+    local n_pre j_pre tgt_pre site_pre host_pre port_pre sid_pre pre_err=0
+    n_pre="$(jq '.targets | length' <<<"$svc")"
+    for (( j_pre=0; j_pre<n_pre; j_pre++ )); do
+      tgt_pre="$(jq -c --argjson j "$j_pre" '.targets[$j]' <<<"$svc")"
+      site_pre="$(jq -r '.site // empty' <<<"$tgt_pre")"
+      host_pre="$(jq -r '.hostname // empty' <<<"$tgt_pre")"
+      port_pre="$(jq -r '.port // empty' <<<"$tgt_pre")"
+      if [[ -z "$site_pre" || -z "$host_pre" || -z "$port_pre" ]]; then
+        echo "  ! $name: target #$((j_pre+1)) missing site/hostname/port" >&2
+        pre_err=1; continue
+      fi
+      if [[ "$DRY_RUN" == 1 ]]; then continue; fi
+      sid_pre="$(jq -n -r --argjson data "$sites" --arg n "$site_pre" \
+        '[$data[] | select(has("name") and .name == $n)][0].siteId // ""')"
+      if [[ -z "$sid_pre" ]]; then
+        echo "  ! $name: site not found: $site_pre" >&2
+        pre_err=1
+      fi
+    done
+    if [[ "$pre_err" == 1 ]]; then
+      echo "FAIL  $name ($full_domain)" >&2
+      failed=$((failed+1)); continue
+    fi
+
+    # existing resource by fullDomain?
+    local existing rid status
+    existing="$(jq -n -c --argjson data "$resources" --arg fd "$full_domain" \
+      '[$data[] | select(has("fullDomain") and .fullDomain == $fd)][0] // empty')"
+    if [[ -n "$existing" ]]; then
+      rid="$(jq -r '.resourceId' <<<"$existing")"
+      status="updated"
+    else
+      status="created"
+      mode="$(jq -r '.mode // "http"' <<<"$svc")"
+      local body resp
+      body="$(jq -n --arg name "$name" --arg domainId "$domain_id" --arg mode "$mode" \
+        --arg subdomain "$subdomain" \
+        '{name:$name, domainId:$domainId, mode:$mode, subdomain:$subdomain}')"
+      if [[ "$DRY_RUN" == 1 ]]; then
+        rid="<new-resource-id>"
+        run_write PUT "/org/$PANGOLIN_ORG_ID/resource" "$body"
+      else
+        resp="$(do_write PUT "/org/$PANGOLIN_ORG_ID/resource" "$body")" || { failed=$((failed+1)); continue; }
+        rid="$(jq -r '.data.resourceId // empty' <<<"$resp")"
+      fi
+    fi
+
+    # reconcile targets (skip existing siteId+ip+port matches; no update endpoint)
+    local existing_targets t n2 j2 added=0 terr=0
+    existing_targets='[]'
+    if [[ "$status" == "updated" && "$DRY_RUN" != 1 ]]; then
+      existing_targets="$(collect_all targets "/resource/$rid/targets")"
+    fi
+    n2="$(jq '.targets | length' <<<"$svc")"
+    for (( j2=0; j2<n2; j2++ )); do
+      local tgt site_name hostname port method site_id
+      tgt="$(jq -c --argjson j "$j2" '.targets[$j]' <<<"$svc")"
+      site_name="$(jq -r '.site // empty' <<<"$tgt")"
+      hostname="$(jq -r '.hostname // empty' <<<"$tgt")"
+      port="$(jq -r '.port // empty' <<<"$tgt")"
+      method="$(jq -r '.method // "http"' <<<"$tgt")"
+      if [[ -z "$site_name" || -z "$hostname" || -z "$port" ]]; then
+        echo "  ! $name: target #$((j2+1)) missing site/hostname/port" >&2
+        terr=1; continue
+      fi
+      site_id="$(jq -n -r --argjson data "$sites" --arg n "$site_name" \
+        '[$data[] | select(has("name") and .name == $n)][0].siteId // ""')"
+      if [[ -z "$site_id" ]]; then
+        if [[ "$DRY_RUN" == 1 ]]; then
+          site_id="<site-id-for:$site_name>"
+        else
+          echo "  ! $name: site not found: $site_name" >&2
+          terr=1; continue
+        fi
+      fi
+      if [[ "$status" == "updated" && "$DRY_RUN" != 1 ]] && \
+         jq -ne --argjson data "$existing_targets" --argjson sid "$site_id" \
+           --arg h "$hostname" --argjson p "$port" \
+           '[$data[] | select(.siteId == $sid and .ip == $h and .port == $p)] | length > 0' \
+           >/dev/null 2>&1; then
+        continue
+      fi
+      local tbody
+      if [[ "$DRY_RUN" == 1 ]]; then
+        # placeholder ids are strings; the curl body is display-only
+        tbody="$(jq -n --arg siteId "$site_id" --arg ip "$hostname" --arg port "$port" \
+          --arg method "$method" '{siteId:$siteId, ip:$ip, port:$port, method:$method}')"
+      else
+        tbody="$(jq -n --argjson siteId "$site_id" --arg ip "$hostname" --argjson port "$port" \
+          --arg method "$method" '{siteId:$siteId, ip:$ip, port:$port, method:$method}')"
+      fi
+      if [[ "$DRY_RUN" == 1 ]]; then
+        run_write PUT "/resource/$rid/target" "$tbody"
+      else
+        local tresp
+        tresp="$(do_write PUT "/resource/$rid/target" "$tbody")" || { terr=1; continue; }
+      fi
+      added=$((added+1))
+    done
+
+    if [[ "$terr" == 1 ]]; then
+      echo "FAIL  $name ($full_domain)" >&2
+      failed=$((failed+1))
+    elif [[ "$DRY_RUN" == 1 ]]; then
+      echo "WOULD $status $name ($full_domain) [+$added targets]"
+    elif [[ "$status" == "created" ]]; then
+      echo "CREATED $name ($full_domain) [+$added targets]"
+      created=$((created+1))
+    else
+      echo "UPDATED $name ($full_domain) [targets reconciled: +$added added]"
+      updated=$((updated+1))
+    fi
+  done
+
+  [[ "$DRY_RUN" == 1 ]] && return 0
+  echo ""
+  echo "Summary: $created created, $updated updated, $skipped skipped, $failed failed"
+  [[ "$failed" == 0 ]] || exit 1
 }
 
 # --- main -------------------------------------------------------------------
@@ -348,6 +597,7 @@ main() {
     add-target) cmd_add_target "${2:-}" ;;
     assign) cmd_assign "${2:-}" ;;
     apply-blueprint) cmd_apply_blueprint "${2:-}" ;;
+    apply-services) cmd_apply_services "${2:-services.yaml}" ;;
     "")
       usage
       exit 2
