@@ -21,6 +21,23 @@ if [[ "${3:-}" == "--body" && -n "${4:-}" ]]; then
   BODY="$4"
 fi
 
+# Split query string off the path (e.g. /org/x/sites?limit=100&offset=0)
+QUERY=""
+if [[ "$PATH_ARG" == *\?* ]]; then
+  QUERY="${PATH_ARG#*\?}"
+  PATH_ARG="${PATH_ARG%%\?*}"
+fi
+
+qparam() { # <name> <default> — read a query param from $QUERY
+  local name="$1" default="$2" rest val
+  rest="${QUERY#*"${name}="}"
+  if [[ "$rest" != "$QUERY" ]]; then
+    val="${rest%%&*}"
+    [[ -n "$val" ]] && { echo "$val"; return; }
+  fi
+  echo "$default"
+}
+
 # --- envelope helpers ------------------------------------------------------
 envelope() { # <data-json> <success> <error> <message> <status>
   jq -n --argjson data "$1" --argjson success "$2" --argjson error "$3" \
@@ -84,9 +101,11 @@ save_state() { # <new-state-json>
 
 # --- handlers ---------------------------------------------------------------
 list_entities() { # <entity-key> <status-message>
-  local key="$1" msg="$2" data
-  data="$(jq -c --arg key "$key" \
-    '{($key): .[$key], pagination: {total: (.[$key] | length), limit: 1000, offset: 0}}' \
+  local key="$1" msg="$2" limit offset data
+  limit="$(qparam limit 1000)"
+  offset="$(qparam offset 0)"
+  data="$(jq -c --arg key "$key" --argjson limit "$limit" --argjson offset "$offset" \
+    '.[$key] as $all | {($key): $all[($offset):($offset + $limit)], pagination: {total: ($all | length), limit: $limit, offset: $offset}}' \
     "$STATE_FILE")"
   envelope "$data" true false "$msg" 200
 }
@@ -199,6 +218,10 @@ main() {
   ensure_state
   if ! auth_ok; then
     envelope 'null' false true "Invalid or missing API key" 401
+    exit 0
+  fi
+  if [[ "${PANGOLIN_MOCK_ERROR:-}" == "1" ]]; then
+    envelope 'null' false true "Internal server error (simulated)" 500
     exit 0
   fi
   case "$METHOD $PATH_ARG" in

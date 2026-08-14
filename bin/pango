@@ -137,20 +137,35 @@ render_table() {
 
 # --- commands ---------------------------------------------------------------
 # do_list <entity-key> <path> <field1> <field2> ...
+#   loops limit/offset pages until pagination.total is consumed, then renders
 do_list() {
   local key="$1" path="$2"
   shift 2
-  if [[ "$DRY_RUN" == 1 ]]; then
-    api_call GET "$path"
-    return 0
-  fi
-  local resp
-  resp="$(api_call GET "$path")" || {
-    echo "error: API call failed" >&2
-    exit 1
-  }
-  check_envelope "$resp"
-  render_table "$resp" "$key" "$@"
+  local page_size="${PANGOLIN_PAGE_SIZE:-1000}"
+  local offset=0 total=1
+  local resp rows collected='[]' sep
+
+  while (( offset < total )); do
+    if [[ "$path" == *\?* ]]; then sep='&'; else sep='?'; fi
+    if [[ "$DRY_RUN" == 1 ]]; then
+      api_call GET "${path}${sep}limit=${page_size}&offset=${offset}"
+      return 0
+    fi
+    resp="$(api_call GET "${path}${sep}limit=${page_size}&offset=${offset}")" || {
+      echo "error: API call failed" >&2
+      exit 1
+    }
+    check_envelope "$resp"
+    total="$(jq -r '.data.pagination.total // 1' <<<"$resp")"
+    rows="$(jq -c --arg key "$key" '[.data[$key][]?]' <<<"$resp")"
+    collected="$(jq -c --argjson rows "$rows" '. + $rows' <<<"$collected")"
+    offset=$(( offset + page_size ))
+  done
+
+  local wrapped
+  wrapped="$(jq -n --arg key "$key" --argjson items "$collected" \
+    '{data: {($key): $items, pagination: {total: ($items | length)}}}')"
+  render_table "$wrapped" "$key" "$@"
 }
 
 cmd_list() {
