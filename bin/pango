@@ -16,6 +16,7 @@ REPO_DIR="$(dirname "$SCRIPT_DIR")"
 
 MOCK=0
 DRY_RUN=0
+FROM_DEFAULTS=0
 
 # --- config ---------------------------------------------------------------
 load_env() {
@@ -41,6 +42,15 @@ Usage:
 Commands:
   list <entity>          List entities: sites | resources | domains | clients |
                          users | roles | targets (targets: --resource-id N)
+  create-site <name>     Create a site (--type newt|wireguard|local, default newt;
+                         --from-defaults pulls address/newtId/secret first)
+  create-resource <name> Create a public resource (--domain-id <id> required;
+                         --subdomain <sub>; --mode http|ssh|rdp|vnc|tcp|udp)
+  add-target <rid>       Attach a target to a resource (--site-id N --ip X
+                         --port N required; --method http default)
+  assign <rid>           Grant access (--role <id> or --user <id>, exactly one)
+  apply-blueprint <file|b64>  Apply a blueprint (JSON file base64-encoded, or a
+                         pre-encoded base64 payload)
   help                   Show this help
 
 Flags:
@@ -48,6 +58,7 @@ Flags:
   --dry-run              Print the exact curl command, do not execute
   --endpoint URL         Override PANGOLIN_API_ENDPOINT
   --org ID               Override PANGOLIN_ORG_ID
+  --resource-id N        Resource id (list targets, add-target, assign)
 
 Env:
   PANGOLIN_API_KEY       Bearer token (required for live/mock calls)
@@ -193,6 +204,113 @@ cmd_list() {
   esac
 }
 
+# --- write commands ----------------------------------------------------------
+# do_write <method> <path> <body> — guard dry-run, call, surface envelope
+do_write() {
+  local method="$1" path="$2" body="$3"
+  if [[ "$DRY_RUN" == 1 ]]; then
+    api_call "$method" "$path" "$body"
+    return 0
+  fi
+  local resp
+  resp="$(api_call "$method" "$path" "$body")" || {
+    echo "error: API call failed" >&2
+    exit 1
+  }
+  check_envelope "$resp"
+  jq -r '"OK: " + (.message // "success")' <<<"$resp"
+}
+
+cmd_create_site() {
+  local name="$1" type="${SITE_TYPE:-newt}" body resp
+  [[ -n "$name" ]] || { echo "error: create-site requires a name" >&2; exit 2; }
+  case "$type" in newt|wireguard|local) ;; *) echo "error: --type must be newt|wireguard|local" >&2; exit 2 ;; esac
+
+  if [[ "$FROM_DEFAULTS" == 1 ]]; then
+    local dresp addr nt sec
+    if [[ "$DRY_RUN" == 1 ]]; then
+      api_call GET "/org/$PANGOLIN_ORG_ID/pick-site-defaults"
+      body="$(jq -n --arg name "$name" --arg type "$type" \
+        --arg address '<from-pick-site-defaults>' --arg newtId '<from-pick-site-defaults>' \
+        --arg secret '<from-pick-site-defaults>' \
+        '{name:$name, type:$type, address:$address, newtId:$newtId, secret:$secret}')"
+      do_write PUT "/org/$PANGOLIN_ORG_ID/site" "$body"
+      return 0
+    fi
+    dresp="$(api_call GET "/org/$PANGOLIN_ORG_ID/pick-site-defaults")" || exit 1
+    check_envelope "$dresp"
+    addr="$(jq -r '.data.address // ""' <<<"$dresp")"
+    nt="$(jq -r '.data.newtId // ""' <<<"$dresp")"
+    sec="$(jq -r '.data.secret // ""' <<<"$dresp")"
+    body="$(jq -n --arg name "$name" --arg type "$type" \
+      --arg address "$addr" --arg newtId "$nt" --arg secret "$sec" \
+      '{name:$name, type:$type, address:$address, newtId:$newtId, secret:$secret}')"
+    do_write PUT "/org/$PANGOLIN_ORG_ID/site" "$body"
+    return 0
+  fi
+
+  body="$(jq -n --arg name "$name" --arg type "$type" '{name:$name, type:$type}')"
+  do_write PUT "/org/$PANGOLIN_ORG_ID/site" "$body"
+}
+
+cmd_create_resource() {
+  local name="$1" domain_id="${DOMAIN_ID:-}" subdomain="${SUBDOMAIN:-}" mode="${MODE:-http}" body
+  [[ -n "$name" ]] || { echo "error: create-resource requires a name" >&2; exit 2; }
+  [[ -n "$domain_id" ]] || { echo "error: create-resource requires --domain-id <id>" >&2; exit 2; }
+  case "$mode" in http|ssh|rdp|vnc|tcp|udp) ;; *) echo "error: --mode must be http|ssh|rdp|vnc|tcp|udp" >&2; exit 2 ;; esac
+
+  body="$(jq -n --arg name "$name" --arg domainId "$domain_id" \
+    --arg subdomain "$subdomain" --arg mode "$mode" \
+    '{name:$name, domainId:$domainId, mode:$mode, subdomain:$subdomain}')"
+  do_write PUT "/org/$PANGOLIN_ORG_ID/resource" "$body"
+}
+
+cmd_add_target() {
+  local rid="${1:-}" site_id="${SITE_ID:-}" ip="${IP:-}" port="${PORT:-}" method="${METHOD:-http}" body
+  [[ -n "$rid" ]] || { echo "error: add-target requires <resource-id>" >&2; exit 2; }
+  [[ -n "$site_id" && -n "$ip" && -n "$port" ]] || {
+    echo "error: add-target requires --site-id N --ip X --port N" >&2; exit 2; }
+  [[ "$site_id" =~ ^[0-9]+$ ]] || { echo "error: --site-id must be numeric" >&2; exit 2; }
+  [[ "$port" =~ ^[0-9]+$ ]] || { echo "error: --port must be numeric" >&2; exit 2; }
+
+  body="$(jq -n --argjson siteId "$site_id" --arg ip "$ip" --argjson port "$port" \
+    --arg method "$method" '{siteId:$siteId, ip:$ip, port:$port, method:$method}')"
+  do_write PUT "/resource/$rid/target" "$body"
+}
+
+cmd_assign() {
+  local rid="${1:-}" role="${ROLE:-}" user="${USER_ID:-}" body
+  [[ -n "$rid" ]] || { echo "error: assign requires <resource-id>" >&2; exit 2; }
+  if [[ -n "$role" && -n "$user" ]]; then
+    echo "error: assign takes exactly one of --role or --user" >&2; exit 2
+  fi
+  if [[ -n "$role" ]]; then
+    [[ "$role" =~ ^[0-9]+$ ]] || { echo "error: --role must be numeric" >&2; exit 2; }
+    body="$(jq -n --argjson roleId "$role" '{roleId:$roleId}')"
+    do_write POST "/resource/$rid/roles/add" "$body"
+  elif [[ -n "$user" ]]; then
+    body="$(jq -n --arg userId "$user" '{userId:$userId}')"
+    do_write POST "/resource/$rid/users/add" "$body"
+  else
+    echo "error: assign requires --role <id> or --user <id>" >&2; exit 2
+  fi
+}
+
+cmd_apply_blueprint() {
+  local payload="${1:-}" blueprint body
+  [[ -n "$payload" ]] || {
+    echo "error: apply-blueprint requires a file path or pre-encoded base64 payload" >&2; exit 2; }
+  if [[ -f "$payload" ]]; then
+    blueprint="$(base64 -w0 "$payload")"
+  else
+    [[ "$payload" =~ ^[A-Za-z0-9+/=]+$ ]] || {
+      echo "error: payload is neither an existing file nor valid base64" >&2; exit 2; }
+    blueprint="$payload"
+  fi
+  body="$(jq -n --arg blueprint "$blueprint" '{blueprint:$blueprint}')"
+  do_write PUT "/org/$PANGOLIN_ORG_ID/blueprint" "$body"
+}
+
 # --- main -------------------------------------------------------------------
 main() {
   load_env
@@ -205,6 +323,17 @@ main() {
       --endpoint) PANGOLIN_API_ENDPOINT="$2"; shift 2 ;;
       --org) PANGOLIN_ORG_ID="$2"; shift 2 ;;
       --resource-id) RESOURCE_ID="$2"; shift 2 ;;
+      --type) SITE_TYPE="$2"; shift 2 ;;
+      --from-defaults) FROM_DEFAULTS=1; shift ;;
+      --domain-id) DOMAIN_ID="$2"; shift 2 ;;
+      --subdomain) SUBDOMAIN="$2"; shift 2 ;;
+      --mode) MODE="$2"; shift 2 ;;
+      --site-id) SITE_ID="$2"; shift 2 ;;
+      --ip) IP="$2"; shift 2 ;;
+      --port) PORT="$2"; shift 2 ;;
+      --method) METHOD="$2"; shift 2 ;;
+      --role) ROLE="$2"; shift 2 ;;
+      --user) USER_ID="$2"; shift 2 ;;
       help|-h|--help) usage; exit 0 ;;
       *) args+=("$1"); shift ;;
     esac
@@ -214,6 +343,11 @@ main() {
   local command="${1:-}"
   case "$command" in
     list) cmd_list "${2:-}" ;;
+    create-site) cmd_create_site "${2:-}" ;;
+    create-resource) cmd_create_resource "${2:-}" ;;
+    add-target) cmd_add_target "${2:-}" ;;
+    assign) cmd_assign "${2:-}" ;;
+    apply-blueprint) cmd_apply_blueprint "${2:-}" ;;
     "")
       usage
       exit 2
