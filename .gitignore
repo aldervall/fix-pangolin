@@ -1,0 +1,6 @@
+# Pangolin api-tools — ignore secrets, evidence, local state
+.env
+*.key
+evidence/
+.mock-state.json
+*.tmp

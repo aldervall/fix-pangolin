@@ -1,0 +1,213 @@
+#!/usr/bin/env bash
+# pango — thin Pangolin Integration API CLI (bash + curl + jq, no other deps)
+#
+# Config via env: PANGOLIN_API_KEY, PANGOLIN_API_ENDPOINT, PANGOLIN_ORG_ID
+# (optionally loaded from .env in the repo root).
+#
+# Flags:
+#   --mock      use the canned mock API (mock-api.sh) instead of the live API
+#   --dry-run   print the exact curl command without executing it
+#   --endpoint  override API base URL
+#   --org       override organization id
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(dirname "$SCRIPT_DIR")"
+
+MOCK=0
+DRY_RUN=0
+
+# --- config ---------------------------------------------------------------
+load_env() {
+  local env_file="$REPO_DIR/.env"
+  if [[ -f "$env_file" ]]; then
+    set -a
+    # shellcheck disable=SC1090
+    source "$env_file"
+    set +a
+  fi
+}
+
+PANGOLIN_API_ENDPOINT="${PANGOLIN_API_ENDPOINT:-https://api.pangolin.aldervall.se}"
+PANGOLIN_ORG_ID="${PANGOLIN_ORG_ID:-aldervall}"
+
+usage() {
+  cat <<'EOF'
+pango — Pangolin Integration API CLI
+
+Usage:
+  pango [--mock] [--dry-run] <command> [args]
+
+Commands:
+  list <entity>          List entities: sites | resources | domains | clients |
+                         users | roles | targets (targets: --resource-id N)
+  help                   Show this help
+
+Flags:
+  --mock                 Use the canned mock API (mock-api.sh)
+  --dry-run              Print the exact curl command, do not execute
+  --endpoint URL         Override PANGOLIN_API_ENDPOINT
+  --org ID               Override PANGOLIN_ORG_ID
+
+Env:
+  PANGOLIN_API_KEY       Bearer token (required for live/mock calls)
+  PANGOLIN_API_ENDPOINT  API base, default https://api.pangolin.aldervall.se
+  PANGOLIN_ORG_ID        Organization id, default aldervall
+EOF
+}
+
+# --- API plumbing -----------------------------------------------------------
+# api_call <METHOD> <PATH> [body-json]
+#   live: curl against $PANGOLIN_API_ENDPOINT/v1$PATH
+#   mock: PANGOLIN_API_KEY=<key> bash mock-api.sh METHOD PATH [--body json]
+#   dry-run: print the exact curl command (key redacted) and exit 0
+api_call() {
+  local method="$1" path="$2" body="${3:-}"
+
+  local url="${PANGOLIN_API_ENDPOINT%/}/v1${path}"
+
+  if [[ "$DRY_RUN" == 1 ]]; then
+    printf 'curl -sS -X %s %s -H %s' "$method" "$url" \
+      "'Authorization: Bearer \$PANGOLIN_API_KEY'"
+    if [[ -n "$body" ]]; then
+      printf ' -H %s -d %s' "'Content-Type: application/json'" "'$body'"
+    fi
+    printf '\n'
+    return 0
+  fi
+
+  if [[ -z "${PANGOLIN_API_KEY:-}" ]]; then
+    echo "error: set PANGOLIN_API_KEY (see .env.example)" >&2
+    exit 1
+  fi
+
+  if [[ "$MOCK" == 1 ]]; then
+    if [[ -n "$body" ]]; then
+      PANGOLIN_API_KEY="$PANGOLIN_API_KEY" bash "$REPO_DIR/mock-api.sh" "$method" "$path" --body "$body"
+    else
+      PANGOLIN_API_KEY="$PANGOLIN_API_KEY" bash "$REPO_DIR/mock-api.sh" "$method" "$path"
+    fi
+    return 0
+  fi
+
+  local cmd=(curl -sS -X "$method" "$url" -H "Authorization: Bearer ${PANGOLIN_API_KEY}")
+  if [[ -n "$body" ]]; then
+    cmd+=(-H "Content-Type: application/json" -d "$body")
+  fi
+  "${cmd[@]}"
+}
+
+# check_envelope <response-json>
+#   surfaces envelope errors: error:true OR status>=400 -> message to stderr, exit 1
+check_envelope() {
+  local resp="$1" error status message
+  error="$(jq -r '.error // false' <<<"$resp")"
+  status="$(jq -r '.status // 0' <<<"$resp")"
+  message="$(jq -r '.message // ""' <<<"$resp")"
+  if [[ "$error" == "true" || "$status" -ge 400 ]]; then
+    echo "API error ($status): $message" >&2
+    exit 1
+  fi
+}
+
+# render_table <response-json> <entity-key> <field1> <field2> ...
+#   prints a column table of data.<entity-key>[] rows
+render_table() {
+  local resp="$1" key="$2"
+  shift 2
+  local fields=("$@")
+  local fields_json
+  fields_json="$(printf '%s\n' "${fields[@]}" | jq -R . | jq -s .)"
+
+  local rows
+  rows="$(jq -r --arg key "$key" --argjson fields "$fields_json" '
+    (.data[$key] // []) as $items
+    | if ($items | length) == 0 then "NO_ROWS"
+      else $items[] | [ $fields[] as $f | (. as $it | $it[$f] // "" | tostring) ] | @tsv
+      end' <<<"$resp")"
+
+  if [[ "$rows" == "NO_ROWS" ]]; then
+    echo "No ${key} found"
+    return 0
+  fi
+
+  printf '%s\n' "$(IFS=$'\t'; echo "${fields[*]}")"
+  printf '%s\n' "$rows" | column -t -s $'\t'
+}
+
+# --- commands ---------------------------------------------------------------
+# do_list <entity-key> <path> <field1> <field2> ...
+do_list() {
+  local key="$1" path="$2"
+  shift 2
+  if [[ "$DRY_RUN" == 1 ]]; then
+    api_call GET "$path"
+    return 0
+  fi
+  local resp
+  resp="$(api_call GET "$path")" || {
+    echo "error: API call failed" >&2
+    exit 1
+  }
+  check_envelope "$resp"
+  render_table "$resp" "$key" "$@"
+}
+
+cmd_list() {
+  local entity="${1:-}"
+  local resource_id="${RESOURCE_ID:-}"
+
+  case "$entity" in
+    sites)     do_list sites "/org/$PANGOLIN_ORG_ID/sites" siteId name type address online ;;
+    resources) do_list resources "/org/$PANGOLIN_ORG_ID/resources" resourceId name subdomain fullDomain mode enabled ;;
+    domains)   do_list domains "/org/$PANGOLIN_ORG_ID/domains" domainId baseDomain verified type ;;
+    clients)   do_list clients "/org/$PANGOLIN_ORG_ID/clients" clientId name online ;;
+    users)     do_list users "/org/$PANGOLIN_ORG_ID/users" userId email ;;
+    roles)     do_list roles "/org/$PANGOLIN_ORG_ID/roles" roleId name description ;;
+    targets)
+      if [[ -z "$resource_id" ]]; then
+        echo "error: list targets requires --resource-id N" >&2
+        exit 2
+      fi
+      do_list targets "/resource/$resource_id/targets" targetId resourceId siteId ip port method
+      ;;
+    *)
+      echo "error: unknown entity '$entity' (sites|resources|domains|clients|users|roles|targets)" >&2
+      exit 2
+      ;;
+  esac
+}
+
+# --- main -------------------------------------------------------------------
+main() {
+  load_env
+
+  local args=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --mock) MOCK=1; shift ;;
+      --dry-run) DRY_RUN=1; shift ;;
+      --endpoint) PANGOLIN_API_ENDPOINT="$2"; shift 2 ;;
+      --org) PANGOLIN_ORG_ID="$2"; shift 2 ;;
+      --resource-id) RESOURCE_ID="$2"; shift 2 ;;
+      help|-h|--help) usage; exit 0 ;;
+      *) args+=("$1"); shift ;;
+    esac
+  done
+  set -- "${args[@]}"
+
+  local command="${1:-}"
+  case "$command" in
+    list) cmd_list "${2:-}" ;;
+    "")
+      usage
+      exit 2
+      ;;
+    *)
+      echo "error: unknown command '$command' (see: pango help)" >&2
+      exit 2
+      ;;
+  esac
+}
+
+main "$@"
