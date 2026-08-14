@@ -488,7 +488,7 @@ cmd_apply_services() {
     fi
 
     # reconcile targets (skip existing siteId+ip+port matches; no update endpoint)
-    local existing_targets t n2 j2 added=0 terr=0
+    local existing_targets n2 j2 added=0 terr=0
     existing_targets='[]'
     if [[ "$status" == "updated" && "$DRY_RUN" != 1 ]]; then
       existing_targets="$(collect_all targets "/resource/$rid/targets")"
@@ -534,8 +534,8 @@ cmd_apply_services() {
       if [[ "$DRY_RUN" == 1 ]]; then
         run_write PUT "/resource/$rid/target" "$tbody"
       else
-        local tresp
-        tresp="$(do_write PUT "/resource/$rid/target" "$tbody")" || { terr=1; continue; }
+        # do_write prints the raw response and exits nonzero on error envelopes
+        do_write PUT "/resource/$rid/target" "$tbody" >/dev/null || { terr=1; continue; }
       fi
       added=$((added+1))
     done
