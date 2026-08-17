@@ -80,7 +80,8 @@ ensure_state() {
     {"clientId": 501, "name": "laptop", "online": true},
     {"clientId": 502, "name": "phone", "online": false}
   ],
-  "counters": {"siteId": 9000, "resourceId": 9000, "targetId": 9000}
+  "healthchecks": [],
+  "counters": {"siteId": 9000, "resourceId": 9000, "targetId": 9000, "healthCheckId": 9000}
 }
 EOF
   fi
@@ -101,24 +102,32 @@ save_state() { # <new-state-json>
 
 # --- handlers ---------------------------------------------------------------
 list_entities() { # <entity-key> <status-message>
-  local key="$1" msg="$2" limit offset data
-  limit="$(qparam limit 1000)"
-  offset="$(qparam offset 0)"
-  data="$(jq -c --arg key "$key" --argjson limit "$limit" --argjson offset "$offset" \
-    '.[$key] as $all | {($key): $all[($offset):($offset + $limit)], pagination: {total: ($all | length), limit: $limit, offset: $offset}}' \
+  local key="$1" msg="$2" ps pg off data
+  # Accept both pageSize/page and limit/offset pagination styles
+  ps="$(qparam pageSize 0)"; [[ "$ps" == "0" ]] && ps="$(qparam limit 1000)"
+  pg="$(qparam page 0)";     [[ "$pg" == "0" ]] && pg=1
+  off="$(qparam offset 0)"
+  # Convert limit/offset to pageSize/page for the jq slice
+  if [[ "$off" -gt 0 ]]; then
+    pg=$(( off / ps + 1 ))
+  fi
+  data="$(jq -c --arg key "$key" --argjson ps "$ps" --argjson pg "$pg" \
+    '.[$key] as $all | {($key): $all[(($pg-1)*$ps):(($pg-1)*$ps + $ps)], pagination: {total: ($all | length), pageSize: $ps, page: $pg}}' \
     "$STATE_FILE")"
   envelope "$data" true false "$msg" 200
 }
 
 list_targets() { # GET /resource/{id}/targets — only targets of that resource
-  local rid limit offset data
+  local rid ps pg off data
   rid="$(sed -E 's#^/resource/([0-9]+)/targets$#\1#' <<<"$PATH_ARG")"
-  limit="$(qparam limit 1000)"
-  offset="$(qparam offset 0)"
-  data="$(jq -c --argjson rid "$rid" --argjson limit "$limit" --argjson offset "$offset" \
+  ps="$(qparam pageSize 0)"; [[ "$ps" == "0" ]] && ps="$(qparam limit 1000)"
+  pg="$(qparam page 0)";     [[ "$pg" == "0" ]] && pg=1
+  off="$(qparam offset 0)"
+  if [[ "$off" -gt 0 ]]; then pg=$(( off / ps + 1 )); fi
+  data="$(jq -c --argjson rid "$rid" --argjson ps "$ps" --argjson pg "$pg" \
     '[.targets[] | select(.resourceId == $rid)] as $all |
-     {targets: $all[($offset):($offset + $limit)],
-      pagination: {total: ($all | length), limit: $limit, offset: $offset}}' \
+     {targets: $all[(($pg-1)*$ps):(($pg-1)*$ps + $ps)],
+      pagination: {total: ($all | length), pageSize: $ps, page: $pg}}' \
     "$STATE_FILE")"
   envelope "$data" true false "Targets retrieved successfully" 200
 }
@@ -226,6 +235,84 @@ apply_blueprint() {
   envelope 'null' true false "Blueprint applied successfully" 200
 }
 
+# --- healthcheck handlers -----------------------------------------------------
+
+list_health_checks() { # GET /org/{orgId}/health-checks
+  local ps pg off data
+  ps="$(qparam pageSize 0)"; [[ "$ps" == "0" ]] && ps="$(qparam limit 1000)"
+  pg="$(qparam page 0)";     [[ "$pg" == "0" ]] && pg=1
+  off="$(qparam offset 0)"
+  if [[ "$off" -gt 0 ]]; then pg=$(( off / ps + 1 )); fi
+  data="$(jq -c --argjson ps "$ps" --argjson pg "$pg" \
+    '.healthchecks as $all | {healthChecks: $all[(($pg-1)*$ps):(($pg-1)*$ps + $ps)], pagination: {total: ($all | length), pageSize: $ps, page: $pg}}' \
+    "$STATE_FILE")"
+  envelope "$data" true false "Health checks retrieved successfully" 200
+}
+
+create_health_check() {
+  local name siteId data
+  name="$(jq -r '.name // empty' <<<"$BODY")"
+  siteId="$(jq -r '.siteId // empty' <<<"$BODY")"
+  [[ -n "$name" ]] || { envelope 'null' false true 'name is required' 400; exit 0; }
+  [[ -n "$siteId" ]] || { envelope 'null' false true 'siteId is required' 400; exit 0; }
+  if ! jq -e --argjson id "$siteId" '.sites[] | select(.siteId == $id)' "$STATE_FILE" >/dev/null 2>&1; then
+    envelope 'null' false true "Site not found: $siteId" 404; exit 0
+  fi
+  local hcId
+  hcId="$(next_id healthCheckId)"
+  local state
+  state="$(jq --argjson id "$hcId" --arg name "$name" --argjson siteId "$siteId" \
+    '.healthchecks += [{healthCheckId:$id, name:$name, siteId:$siteId, hcEnabled:false, hcMode:"http", hcMethod:"GET", hcInterval:30, hcUnhealthyInterval:30, hcTimeout:1, hcFollowRedirects:true, hcHealthyThreshold:1, hcUnhealthyThreshold:1, hcHeaders:null, hcStatus:null}]' \
+    "$STATE_FILE")"
+  save_state "$state"
+  data="$(jq -n --argjson id "$hcId" --arg name "$name" --argjson siteId "$siteId" \
+    '{healthCheckId:$id, name:$name, siteId:$siteId, hcEnabled:false, hcMode:"http", hcMethod:"GET", hcInterval:30, hcUnhealthyInterval:30, hcTimeout:1, hcFollowRedirects:true, hcHealthyThreshold:1, hcUnhealthyThreshold:1, hcHeaders:null, hcStatus:null}')"
+  envelope "$data" true false "Health check created successfully" 201
+}
+
+update_health_check() {
+  local hcId body_valid data
+  hcId="${PATH_ARG##*/health-check/}"
+  hcId="${hcId%%/*}"
+  if ! jq -e --argjson id "$hcId" '.healthchecks[] | select(.healthCheckId == $id)' "$STATE_FILE" >/dev/null 2>&1; then
+    envelope 'null' false true "Health check not found: $hcId" 404; exit 0
+  fi
+  body_valid="$(jq 'if type == "object" and . != null then true else false end' <<<"$BODY")"
+  if [[ "$body_valid" != "true" ]]; then
+    envelope 'null' false true 'body must be a valid JSON object' 400; exit 0
+  fi
+  local state
+  state="$(jq --argjson id "$hcId" --argjson body "$(jq 'del(.healthCheckId' <<<"$BODY")'" '.healthchecks |= map(if .healthCheckId == $id then ( . + $body ) else . end)' "$STATE_FILE")"
+  save_state "$state"
+  data="$(jq -c --argjson id "$hcId" '.healthchecks[] | select(.healthCheckId == $id)' "$STATE_FILE")"
+  envelope "$data" true false "Health check updated successfully" 200
+}
+
+delete_health_check() {
+  local hcId data
+  hcId="${PATH_ARG##*/health-check/}"
+  hcId="${hcId%%/*}"
+  if ! jq -e --argjson id "$hcId" '.healthchecks[] | select(.healthCheckId == $id)' "$STATE_FILE" >/dev/null 2>&1; then
+    envelope 'null' false true "Health check not found: $hcId" 404; exit 0
+  fi
+  local state
+  state="$(jq --argjson id "$hcId" '.healthchecks = [.healthchecks[] | select(.healthCheckId != $id)]' "$STATE_FILE")"
+  save_state "$state"
+  envelope 'null' true false "Health check deleted successfully" 200
+}
+
+get_health_check_status_history() { # GET /org/{orgId}/health-check/{healthCheckId}/status-history
+  local hcId data
+  hcId="${PATH_ARG##*/health-check/}"
+  hcId="${hcId%%/*}"
+  if ! jq -e --argjson id "$hcId" '.healthchecks[] | select(.healthCheckId == $id)' "$STATE_FILE" >/dev/null 2>&1; then
+    envelope 'null' false true "Health check not found: $hcId" 404; exit 0
+  fi
+  # Return a small history array
+  data="$(jq -n '[{status:"healthy", checkedAt:(now | todate)}, {status:"unhealthy", checkedAt:(now | todate)}]')"
+  envelope "$data" true false "Health check status history retrieved successfully" 200
+}
+
 # --- router -----------------------------------------------------------------
 main() {
   ensure_state
@@ -252,6 +339,11 @@ main() {
     "POST /resource/"*"/roles/add")     add_role ;;
     "POST /resource/"*"/users/add")     add_user ;;
     "PUT /org/"*"/blueprint")           apply_blueprint ;;
+    "GET /org/"*"/health-checks")     list_health_checks ;;
+    "GET /org/"*"/health-check/"*"/status-history") get_health_check_status_history ;;
+    "PUT /org/"*"/health-check")      create_health_check ;;
+    "POST /org/"*"/health-check/"*"") update_health_check ;;
+    "DELETE /org/"*"/health-check/"*"") delete_health_check ;;
     *)
       envelope 'null' false true "Not found: $METHOD $PATH_ARG" 404
       ;;

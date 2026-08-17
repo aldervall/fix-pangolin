@@ -51,9 +51,11 @@ Commands:
   assign <rid>           Grant access (--role <id> or --user <id>, exactly one)
   apply-blueprint <file|b64>  Apply a blueprint (JSON file base64-encoded, or a
                          pre-encoded base64 payload)
-  apply-services <yaml>  Idempotent apply of services.yaml (default: services.yaml);
-                         matches resources by full-domain; reconciles targets;
-                         auto-looks-up domain by baseDomain and site by name
+apply-services <yaml>  Idempotent apply of services.yaml (default: services.yaml);
+                          matches resources by full-domain; reconciles targets;
+                          auto-looks-up domain by baseDomain and site by name
+  apply-healthchecks <yaml>  Idempotent apply of health checks from services.yaml;
+                          upserts health check per service with hcEnabled/hcMode/etc.
   help                   Show this help
 
 Flags:
@@ -150,40 +152,55 @@ render_table() {
 }
 
 # --- commands ---------------------------------------------------------------
-# collect_all <entity-key> <path> — echoes a JSON array with all pages fetched
+# collect_all <entity-key> <path> [style]
+#   style: "size" (default) uses pageSize/page; "offset" uses limit/offset
+#   echoes a JSON array with all pages fetched
 collect_all() {
-  local key="$1" path="$2"
-  local page_size="${PANGOLIN_PAGE_SIZE:-1000}" offset=0 total=1
+  local key="$1" path="$2" style="${3:-size}"
+  local page_size="${PANGOLIN_PAGE_SIZE:-1000}" page=1 total=1
   local resp rows collected='[]' sep
 
-  while (( offset < total )); do
+  while (( (page - 1) * page_size < total )); do
     if [[ "$path" == *\?* ]]; then sep='&'; else sep='?'; fi
-    resp="$(api_call GET "${path}${sep}limit=${page_size}&offset=${offset}")" || {
-      echo "error: API call failed" >&2
-      exit 1
-    }
+    if [[ "$style" == "offset" ]]; then
+      local offset=$(( (page - 1) * page_size ))
+      resp="$(api_call GET "${path}${sep}limit=${page_size}&offset=${offset}")" || {
+        echo "error: API call failed" >&2
+        exit 1
+      }
+    else
+      resp="$(api_call GET "${path}${sep}pageSize=${page_size}&page=${page}")" || {
+        echo "error: API call failed" >&2
+        exit 1
+      }
+    fi
     check_envelope "$resp"
     total="$(jq -r '.data.pagination.total // 1' <<<"$resp")"
     rows="$(jq -c --arg key "$key" '[.data[$key][]?]' <<<"$resp")"
     collected="$(jq -c --argjson rows "$rows" '. + $rows' <<<"$collected")"
-    offset=$(( offset + page_size ))
+    page=$(( page + 1 ))
   done
 
   printf '%s' "$collected"
 }
 
-# do_list <entity-key> <path> <field1> <field2> ...
-#   loops limit/offset pages until pagination.total is consumed, then renders
+# do_list <entity-key> <path> [style] <field1> <field2> ...
+#   style: "size" (default) uses pageSize/page; "offset" uses limit/offset
+#   loops pages until pagination.total is consumed, then renders
 do_list() {
-  local key="$1" path="$2"
-  shift 2
+  local key="$1" path="$2" style="${3:-size}"
+  shift 3 2>/dev/null || shift 2  # shift key, path, [style]
   if [[ "$DRY_RUN" == 1 ]]; then
     local sep='?'; [[ "$path" == *\?* ]] && sep='&'
-    api_call GET "${path}${sep}limit=${PANGOLIN_PAGE_SIZE:-1000}&offset=0"
+    if [[ "$style" == "offset" ]]; then
+      api_call GET "${path}${sep}limit=${PANGOLIN_PAGE_SIZE:-1000}&offset=0"
+    else
+      api_call GET "${path}${sep}pageSize=${PANGOLIN_PAGE_SIZE:-1000}&page=1"
+    fi
     return 0
   fi
   local items wrapped
-  items="$(collect_all "$key" "$path")"
+  items="$(collect_all "$key" "$path" "$style")"
   wrapped="$(jq -n --arg key "$key" --argjson items "$items" \
     '{data: {($key): $items, pagination: {total: ($items | length)}}}')"
   render_table "$wrapped" "$key" "$@"
@@ -196,7 +213,7 @@ cmd_list() {
   case "$entity" in
     sites)     do_list sites "/org/$PANGOLIN_ORG_ID/sites" siteId name type address online ;;
     resources) do_list resources "/org/$PANGOLIN_ORG_ID/resources" resourceId name subdomain fullDomain mode enabled ;;
-    domains)   do_list domains "/org/$PANGOLIN_ORG_ID/domains" domainId baseDomain verified type ;;
+    domains)   do_list domains "/org/$PANGOLIN_ORG_ID/domains" offset domainId baseDomain verified type ;;
     clients)   do_list clients "/org/$PANGOLIN_ORG_ID/clients" clientId name online ;;
     users)     do_list users "/org/$PANGOLIN_ORG_ID/users" userId email ;;
     roles)     do_list roles "/org/$PANGOLIN_ORG_ID/roles" roleId name description ;;
@@ -207,8 +224,11 @@ cmd_list() {
       fi
       do_list targets "/resource/$resource_id/targets" targetId resourceId siteId ip port method
       ;;
+    health-checks|healthchecks)
+      do_list healthChecks "/org/$PANGOLIN_ORG_ID/health-checks" offset healthCheckId name resourceId siteId
+      ;;
     *)
-      echo "error: unknown entity '$entity' (sites|resources|domains|clients|users|roles|targets)" >&2
+      echo "error: unknown entity '$entity' (sites|resources|domains|clients|users|roles|targets|health-checks)" >&2
       exit 2
       ;;
   esac
@@ -386,13 +406,13 @@ cmd_apply_services() {
     # dry-run cannot resolve live state; empty arrays let the loop
     # print write curls with <placeholder> ids instead of failing
     sites='[]'; domains='[]'; resources='[]'
-    api_call GET "/org/$PANGOLIN_ORG_ID/sites?limit=1000&offset=0"
+    api_call GET "/org/$PANGOLIN_ORG_ID/sites?pageSize=1000&page=1"
     api_call GET "/org/$PANGOLIN_ORG_ID/domains?limit=1000&offset=0"
-    api_call GET "/org/$PANGOLIN_ORG_ID/resources?limit=1000&offset=0"
+    api_call GET "/org/$PANGOLIN_ORG_ID/resources?pageSize=1000&page=1"
     echo "# apply-services dry-run: prints each write curl below"
   else
     sites="$(collect_all sites "/org/$PANGOLIN_ORG_ID/sites")"
-    domains="$(collect_all domains "/org/$PANGOLIN_ORG_ID/domains")"
+    domains="$(collect_all domains "/org/$PANGOLIN_ORG_ID/domains" offset)"
     resources="$(collect_all resources "/org/$PANGOLIN_ORG_ID/resources")"
   fi
 
@@ -560,6 +580,143 @@ cmd_apply_services() {
   [[ "$failed" == 0 ]] || exit 1
 }
 
+# cmd_apply_healthchecks <services.yaml> — idempotent upsert of health checks:
+#   For each service with a healthcheck block:
+#     1. Resolve resourceId by fullDomain from collect_all resources
+#     2. Resolve siteId from the service's FIRST target's site NAME via collect_all sites
+#        (if no targets or site unknown → SKIP that service, never fail the whole run)
+#     3. List existing health checks by fullDomain match
+#     4. If found → PUT /org/{org}/health-check/{id} (update)
+#        If not found → PUT /org/{org}/health-check (create)
+#     5. Body: name, siteId, hcEnabled:true, hcMode:"http", hcHostname, hcPort,
+#        hcPath:"/", hcScheme:"http", hcMethod:"GET",
+#        hcInterval (default 30), hcTimeout (default 1), hcUnhealthyThreshold (default 1)
+cmd_apply_healthchecks() {
+  local file="${1:-services.yaml}"
+  [[ -f "$file" ]] || { echo "error: healthcheck file not found: $file" >&2; exit 2; }
+
+  local svcs
+  svcs="$(yaml_to_json "$file")" || exit 2
+  svcs="$(jq -c 'if type == "array" then . elif .services then .services else [.] end' <<<"$svcs")"
+
+  local sites resources healthChecks
+  if [[ "$DRY_RUN" == 1 ]]; then
+    # dry-run: empty arrays let the loop print write curls with placeholder ids
+    sites='[]'; resources='[]'; healthChecks='[]'
+    api_call GET "/org/$PANGOLIN_ORG_ID/sites?pageSize=1000&page=1"
+    api_call GET "/org/$PANGOLIN_ORG_ID/resources?pageSize=1000&page=1"
+    api_call GET "/org/$PANGOLIN_ORG_ID/health-checks?limit=1000&offset=0"
+    echo "# apply-healthchecks dry-run: prints each write curl below"
+  else
+    sites="$(collect_all sites "/org/$PANGOLIN_ORG_ID/sites")"
+    resources="$(collect_all resources "/org/$PANGOLIN_ORG_ID/resources")"
+    healthChecks="$(collect_all healthChecks "/org/$PANGOLIN_ORG_ID/health-checks" offset)"
+  fi
+
+  local n i created=0 updated=0 skipped=0 failed=0
+  n="$(jq 'length' <<<"$svcs")"
+
+  for (( i=0; i<n; i++ )); do
+    local svc name full_domain
+    svc="$(jq -c --argjson i "$i" '.[$i]' <<<"$svcs")"
+    name="$(jq -r '.name // empty' <<<"$svc")"
+    full_domain="$(jq -r '."full-domain" // empty' <<<"$svc")"
+    if [[ -z "$name" || -z "$full_domain" ]]; then
+      echo "SKIP  $name: missing name or full-domain"; skipped=$((skipped+1)); continue
+    fi
+
+    # --- resolve resourceId by fullDomain (same pattern as cmd_apply_services) ---
+    local resourceId
+    resourceId="$(jq -n -c --argjson data "$resources" --arg fd "$full_domain" \
+      '[$data[] | select(has("fullDomain") and .fullDomain == $fd)][0].resourceId // empty')"
+    if [[ -z "$resourceId" ]]; then
+      echo "SKIP  $name: no resource matches $full_domain"; skipped=$((skipped+1)); continue
+    fi
+
+    # --- resolve siteId from FIRST target's site name ---
+    local first_hostname first_port first_site
+    first_hostname="$(jq -r '.targets[0].hostname // empty' <<<"$svc")"
+    first_port="$(jq -r '.targets[0].port // empty' <<<"$svc")"
+    first_site="$(jq -r '.targets[0].site // empty' <<<"$svc")"
+
+    if [[ -z "$first_hostname" || -z "$first_port" || -z "$first_site" ]]; then
+      echo "SKIP  $name: no resolvable site (missing target hostname/port)"; skipped=$((skipped+1)); continue
+    fi
+
+    siteId="$(jq -n -r --argjson data "$sites" --arg n "$first_site" \
+      '[$data[] | select(has("name") and .name == $n)][0].siteId // ""')"
+    if [[ -z "$siteId" ]]; then
+      echo "SKIP  $name: no resolvable site: $first_site"; skipped=$((skipped+1)); continue
+    fi
+
+    # --- resolve healthcheck parameters ---
+    local hc_interval hc_timeout hc_retries
+    hc_interval="$(jq -r '.interval // 30' <<<"$svc")"
+    hc_timeout="$(jq -r '.timeout // 1' <<<"$svc")"
+    hc_retries="$(jq -r '.retries // 1' <<<"$svc")"
+
+    # --- list existing health checks, match by name ---
+    local existing_hc_id
+    existing_hc_id="$(jq -n -c --argjson data "$healthChecks" --arg n "$name" \
+      '[$data[] | select(.name == $n)][0].healthCheckId // empty')"
+    if [[ -n "$existing_hc_id" ]]; then
+      # UPDATE: POST to /org/{org}/health-check/{id}
+      local hc_body hc_update_path
+      hc_body="$(jq -n --arg name "$name" --argjson siteId "$siteId" \
+        --argjson hcInterval "$hc_interval" \
+        --argjson hcTimeout "$hc_timeout" \
+        --argjson hcUnhealthyThreshold "$hc_retries" \
+        --arg hcHostname "$first_hostname" \
+        --argjson hcPort "$first_port" \
+        '{name:$name, siteId:$siteId, hcEnabled:true, hcMode:"http", hcHostname:$hcHostname, hcPort:$hcPort, hcPath:"/", hcScheme:"http", hcMethod:"GET", hcInterval:$hcInterval, hcTimeout:$hcTimeout, hcUnhealthyThreshold:$hcUnhealthyThreshold}')"
+      if [[ "$DRY_RUN" == 1 ]]; then
+        api_call PUT "/org/$PANGOLIN_ORG_ID/health-check/$existing_hc_id" "$hc_body"
+        echo "WOULD UPDATE $name"
+      else
+        resp="$(api_call PUT "/org/$PANGOLIN_ORG_ID/health-check/$existing_hc_id" "$hc_body")" || { failed=$((failed+1)); continue; }
+        check_envelope "$resp"
+        echo "UPDATED $name"
+      fi
+    else
+      # CREATE: PUT /org/{org}/health-check
+      local hc_body
+      hc_body="$(jq -n --arg name "$name" --argjson siteId "$siteId" \
+        --argjson hcInterval "$hc_interval" \
+        --argjson hcTimeout "$hc_timeout" \
+        --argjson hcUnhealthyThreshold "$hc_retries" \
+        --arg hcHostname "$first_hostname" \
+        --argjson hcPort "$first_port" \
+        '{name:$name, siteId:$siteId, hcEnabled:true, hcMode:"http", hcHostname:$hcHostname, hcPort:$hcPort, hcPath:"/", hcScheme:"http", hcMethod:"GET", hcInterval:$hcInterval, hcTimeout:$hcTimeout, hcUnhealthyThreshold:$hcUnhealthyThreshold}')"
+      if [[ "$DRY_RUN" == 1 ]]; then
+        api_call PUT "/org/$PANGOLIN_ORG_ID/health-check" "$hc_body"
+        echo "WOULD CREATE $name"
+      else
+        resp="$(api_call PUT "/org/$PANGOLIN_ORG_ID/health-check" "$hc_body")" || { failed=$((failed+1)); continue; }
+        check_envelope "$resp"
+        echo "CREATED $name"
+      fi
+    fi
+
+    if [[ "$DRY_RUN" != 1 ]]; then
+      # In live/mock mode, track counts
+      if [[ -n "$existing_hc_id" ]]; then
+        updated=$((updated+1))
+      else
+        created=$((created+1))
+      fi
+    fi
+  done
+
+  if [[ "$DRY_RUN" == 1 ]]; then
+    echo ""
+    echo "Summary: $created created, $updated updated, $skipped skipped, $failed failed"
+    return 0
+  fi
+  echo ""
+  echo "Summary: $created created, $updated updated, $skipped skipped, $failed failed"
+  [[ "$failed" == 0 ]] || exit 1
+}
+
 # --- main -------------------------------------------------------------------
 main() {
   load_env
@@ -598,6 +755,7 @@ main() {
     assign) cmd_assign "${2:-}" ;;
     apply-blueprint) cmd_apply_blueprint "${2:-}" ;;
     apply-services) cmd_apply_services "${2:-services.yaml}" ;;
+    apply-healthchecks) cmd_apply_healthchecks "${2:-services.yaml}" ;;
     "")
       usage
       exit 2
