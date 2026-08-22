@@ -250,7 +250,11 @@ list_health_checks() { # GET /org/{orgId}/health-checks
 }
 
 create_health_check() {
-  local name siteId data
+  local body_valid name siteId data
+  body_valid="$(jq 'if type == "object" and . != null then true else false end' <<<"$BODY" 2>/dev/null || true)"
+  if [[ "$body_valid" != "true" ]]; then
+    envelope 'null' false true 'body must be a valid JSON object' 400; exit 0
+  fi
   name="$(jq -r '.name // empty' <<<"$BODY")"
   siteId="$(jq -r '.siteId // empty' <<<"$BODY")"
   [[ -n "$name" ]] || { envelope 'null' false true 'name is required' 400; exit 0; }
@@ -282,7 +286,7 @@ update_health_check() {
     envelope 'null' false true 'body must be a valid JSON object' 400; exit 0
   fi
   local state
-  state="$(jq --argjson id "$hcId" --argjson body "$(jq 'del(.healthCheckId' <<<"$BODY")'" '.healthchecks |= map(if .healthCheckId == $id then ( . + $body ) else . end)' "$STATE_FILE")"
+  state="$(jq --argjson id "$hcId" --argjson body "$(jq 'del(.healthCheckId)' <<<"$BODY")'" '.healthchecks |= map(if .healthCheckId == $id then ( . + $body ) else . end)' "$STATE_FILE")"
   save_state "$state"
   data="$(jq -c --argjson id "$hcId" '.healthchecks[] | select(.healthCheckId == $id)' "$STATE_FILE")"
   envelope "$data" true false "Health check updated successfully" 200
