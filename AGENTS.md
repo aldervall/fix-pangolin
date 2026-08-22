@@ -3,38 +3,24 @@
 Thin `pango` CLI (bash + curl + jq, zero other deps) over the self-hosted Pangolin
 Integration API (org `aldervall`, instance `pangolin.aldervall.se`).
 
-## Repo layout (read this first — gotchas)
+## Repo layout
 
 - **Working files live at the repo ROOT** `/opt/fix-pangolin/`: `AGENTS.md`, `bin/pango`,
-  `mock-api.sh`, `services.yaml.example`. The root is **NOT a git repo**.
+  `mock-api.sh`, `services.yaml.example`, `.env`. The root is **NOT a git repo**.
 - **Git history lives in the NESTED clone** `/opt/fix-pangolin/fix-pangolin/` (remote
-  `github.com/aldervall/fix-pangolin`, 6 commits). Its working tree is currently EMPTIED
-  (`git status` shows `D AGENTS.md`, `D bin/pango`, `D mock-api.sh`, `D services.yaml.example`)
-  — the root files are the source of truth. Do not blindly `git add .` in the clone;
-  commit selectively if ever asked.
-- Sibling artifacts referenced by older AGENTS.md versions
-  (`~/.omo/plans/pangolin-knowledge.md`, `~/.omo/research/pangolin-api-catalog.md`,
-  `~/.omo/drafts/pangolin-knowledge.md`, `~/.pangolin/pangolin.json`, `evidence/`)
-  **do not exist in this checkout** — do not reference them as sources of truth.
+  `github.com/aldervall/fix-pangolin`, 7 commits). The working tree mirrors the root —
+  both have identical files. If ever asked to commit, work in the nested clone; do NOT
+  `git add .` blindly (`.env` must stay untracked).
+- `.omo/` contains plan artifacts and evidence from prior sessions — reference only,
+  not source of truth.
 
 ## Hard constraints
 
-- **The live Integration API is currently UNROUTED (verified 2026-08-16).**
-  `api.pangolin.aldervall.se` and `pangolin.aldervall.se` resolve to public `213.64.127.33`;
-  `/v1/*`, `/health`, and `/api/v1/*` all return HTTP 404 with a self-signed
-  `CN=TRAEFIK DEFAULT CERT`. The Pangolin UI itself is up at `10.10.1.3`
-  (HTTP 200, title "Dashboard - Pangolin"). This is a server-side routing/config issue,
-  NOT a code bug — the user must enable the Integration API (config.yml
-  `enable_integration_api: true`, Traefik `int-api-router`, restart) and supply an
-  org-scoped key. Until then: do all work in `--mock` mode; do not burn time debugging
-  live failures (404 happens before auth).
 - **Never touch the Pangolin server**: no SSH, no pangctl, no config.yml edits from this
   repo. Server-side steps are user steps only.
 - **API keys must NEVER be committed.** The user's key belongs in repo-root `.env`
-  (git-ignored; note the root has no `.env.example` — the template lives only in the
-  nested clone). Keys pasted in chat should be **rotated after use**. Where it exists,
-  `~/.pangolin/pangolin.json` holds live credentials — read-only reference only; never
-  copy, echo, or commit its contents.
+  (git-ignored; template at `fix-pangolin/.env.example`). Keys pasted in chat should be
+  **rotated after use**. Never copy, echo, or commit key values.
 - **`PANGOLIN_API_KEY` is required even for `--mock`** (any non-empty value passes mock
   auth; missing key → `error: set PANGOLIN_API_KEY` + exit 1). Config via env or repo-root
   `.env`; defaults: endpoint `https://api.pangolin.aldervall.se`, org `aldervall`,
@@ -45,15 +31,22 @@ Integration API (org `aldervall`, instance `pangolin.aldervall.se`).
 `./bin/pango [--mock] [--dry-run] [--endpoint URL] [--org ORG] <cmd>` — full usage in
 `pango help`.
 
+**Reads:**
 - `list sites|resources|domains|clients|users|roles` — paginated via `limit`/`offset`
   until `pagination.total` is consumed; `list targets` REQUIRES `--resource-id N`
+- `list health-checks` — lists health checks for the org
+
+**Writes:**
 - `create-site <name>` (`--type newt|wireguard|local`, default newt; `--from-defaults`
   calls `pick-site-defaults` first)
 - `create-resource <name>` — REQUIRES `--domain-id`; `--mode http|ssh|rdp|vnc|tcp|udp`
 - `add-target <rid>` — REQUIRES `--site-id` (numeric), `--ip`, `--port` (numeric)
 - `assign <rid>` — exactly one of `--role` (numeric) or `--user`
 - `apply-blueprint <file|base64>` — file gets base64-encoded
-- `apply-services [services.yaml]` — see below
+
+**Bulk ops:**
+- `apply-services [services.yaml]` — idempotent by full-domain (see below)
+- `apply-healthchecks [services.yaml]` — idempotent upsert of health checks (see below)
 
 Exit codes: 1 = API/env error, 2 = usage error. `--dry-run` prints the exact curl with
 the key redacted and exits 0 without executing.
@@ -67,11 +60,21 @@ the key redacted and exits 0 without executing.
   target `site` by site NAME; unknown site → that service FAILs but others still process;
   exits 1 if any service failed.
 - Pre-validates all targets BEFORE any writes (avoids orphan resources on unknown site names).
-- `services.yaml` schema is documented in `services.yaml.example`: `name`, `full-domain`,
+- `services.yaml` schema documented in `services.yaml.example`: `name`, `full-domain`,
   `subdomain` (derived if omitted), `domain-id` (auto if omitted), `mode`,
-  `targets[].site/hostname/port/method`, `auth.sso-enabled`, `healthcheck`. NOTE:
-  `apply-healthchecks` (referenced in the example) is NOT implemented — it's plan Todo 9,
-  live-gated.
+  `targets[].site/hostname/port/method`, `auth.sso-enabled`, `healthcheck`.
+
+## apply-healthchecks semantics (idempotent by name)
+
+- For each service with a `healthcheck` block in `services.yaml`:
+  1. Resolves `resourceId` by `fullDomain` from existing resources
+  2. Resolves `siteId` from the first target's site NAME
+  3. Lists existing health checks, matches by `name`
+  4. If found → PUT update; if not → PUT create
+- Body: `name`, `siteId`, `hcEnabled:true`, `hcMode:"http"`, `hcHostname`, `hcPort`,
+  `hcPath:"/"`, `hcScheme:"http"`, `hcMethod:"GET"`, `hcInterval` (default 30),
+  `hcTimeout` (default 1), `hcUnhealthyThreshold` (default 1)
+- Services with no targets or unknown site names are SKIPed (never fail the whole run).
 
 ## Mock harness (`mock-api.sh`)
 
@@ -82,40 +85,101 @@ the key redacted and exits 0 without executing.
 - Envelope shape everywhere: `{data, success, error, message, status}`; `error:true` or
   `status>=400` → surfaced to stderr + exit 1.
 
+**Mock routes:**
+| Method | Path | Handler |
+|--------|------|---------|
+| GET | `/org/{org}/sites` | list_entities |
+| GET | `/org/{org}/resources` | list_entities |
+| GET | `/org/{org}/domains` | list_entities |
+| GET | `/org/{org}/clients` | list_entities |
+| GET | `/org/{org}/users` | list_entities |
+| GET | `/org/{org}/roles` | list_entities |
+| GET | `/resource/{id}/targets` | list_targets |
+| GET | `/org/{org}/pick-site-defaults` | pick_site_defaults |
+| PUT | `/org/{org}/site` | create_site |
+| PUT | `/org/{org}/resource` | create_resource |
+| PUT | `/resource/{id}/target` | create_target |
+| POST | `/resource/{id}/roles/add` | add_role |
+| POST | `/resource/{id}/users/add` | add_user |
+| PUT | `/org/{org}/blueprint` | apply_blueprint |
+| GET | `/org/{org}/health-checks` | list_health_checks |
+| PUT | `/org/{org}/health-check` | create_health_check |
+| POST | `/org/{org}/health-check/{id}` | update_health_check |
+| DELETE | `/org/{org}/health-check/{id}` | delete_health_check |
+| GET | `/org/{org}/health-check/{id}/status-history` | get_health_check_status_history |
+
 ## Conventions & gotchas
 
-- Commits are prefixed `api-tools:` (one atomic commit per command; later commits use
-  `feat:`/`fix:` sub-prefixes). Live-response evidence goes under `evidence/`
-  (git-ignored). `.env` is never committed.
-- QA gates: `bash -n` on all scripts; shellcheck must be clean at `-S error` (SC2034
-  unused-var warnings were a real issue — see commit `caec39a`).
-- **jq gotcha (documented in the code, ~line 414)**: bind `.baseDomain as $b` BEFORE a pipe — jq
-  evaluates a function-call argument in the context of the piped input (a string), so
-  `.baseDomain` inside `endswith()` there indexes a string, fatal on jq >= 1.8. Preserve
-  this pattern in new lookup code. This machine runs jq 1.7; the pattern is 1.8-safe.
+- QA gates: `bash -n` on all scripts; shellcheck must be clean at `-S error`.
+- **jq gotcha (documented in the code, ~line 434)**: bind `.baseDomain as $b` BEFORE a
+  pipe — jq evaluates a function-call argument in the context of the piped input (a
+  string), so `.baseDomain` inside `endswith()` there indexes a string, fatal on
+  jq >= 1.8. Preserve this pattern in new lookup code. This machine runs jq 1.7;
+  the pattern is 1.8-safe.
 - YAML→JSON uses `yq` with python3+PyYAML fallback (`yaml_to_json`); either must exist
-  for `apply-services`. On this machine `yq` is MISSING but python3+PyYAML is present —
-  the fallback path is what works.
+  for `apply-services` and `apply-healthchecks`. On this machine `yq` is MISSING but
+  python3+PyYAML is present — the fallback path is what works.
 - `set -euo pipefail` is used throughout.
+- `.env` is never committed. `.mock-state.json` is git-ignored.
 
-## Status (as of 2026-08-17)
+## Live API status
 
-- Offline work done (Todos 1, 3–7): endpoint catalog, playbook, and the full CLI verified
-  against the mock.
-- **Live Integration API is ROUTED and working** — `api.pangolin.aldervall.se/v1/*`
-  returns real data. Verified: 5 sites, 42 resources, 3 domains. API key
-  `dsxonm20ljegz1e.voitpkpyqvvxnp3hsbieiv2rhxfdt4pespjqsqcd` confirmed active.
-- **Health checks**: `list health-checks` returns 403. Health checks are a separate
-  feature in Pangolin UI (Alerting → Health Checks), not managed via API key permissions.
-  The Integration API health-check endpoints may require a different auth scope or
-  may not be enabled on this instance.
-- **User's NEWT issue**: 4 NEWT sites (pangolin.aldervall.se, LAN 10.10.1.3) fail to
-  connect — suspected newtId/secret key mismatch between the sites and the newt agents.
-  This is a tunnel-pairing problem, NOT visible via the Integration API; when the API is
-  live, the fix path is `create-site --from-defaults` (picks newtId/secret via
-  `pick-site-defaults`). Not diagnosed in this plan.
-- **Verified live**: `list sites`, `list resources`, `list domains` all work.
-  `apply-services --dry-run` produces correct curl output against live API.
-  `apply-services --mock` is idempotent (no duplicates on re-run).
-- Remaining: Live write test (`apply-services` without `--dry-run`), health-check
-  live verification (blocked by 403), AGENTS.md final status update.
+The Integration API at `api.pangolin.aldervall.se` is routed and working.
+Verified: `list sites`, `list resources`, `list domains` return real data.
+`apply-services --dry-run` produces correct curl output against live API.
+`apply-services --mock` is idempotent (no duplicates on re-run).
+
+Health checks: `list health-checks` may return 403 depending on API key scope.
+Health checks are a separate feature in Pangolin UI (Alerting → Health Checks).
+
+## pangoclient — Client Reachability Tester
+
+Thin `pangoclient` CLI (bash + curl + jq) over the Pangolin Integration API for testing
+machine client reachability through WireGuard tunnels.
+
+**`./bin/pangoclient [--mock] [--dry-run] [--timeout N] [--verbose] <cmd>`**
+
+### Commands
+
+**Reads:**
+- `list clients|resources|domains` — formatted table (ID, NAME, SUBNET, ONLINE / DOMAIN, MODE / TYPE)
+- `inspect <id|name>` — show client details by ID or name
+- `help` — show usage with examples
+
+**Writes:**
+- `create <name>` — create a new machine client (generates olmId, secret, subnet)
+- `delete <id|name>` — delete a client (best-effort; may not work on live API)
+
+**Reachability Test:**
+- `test <id|name>` — test resource reachability from a machine client's perspective
+  - Creates temporary client, connects via WireGuard, probes resources, reports results
+  - `--timeout N` sets probe timeout in seconds (default 5); `--verbose` shows progress
+
+### Flags
+
+- `--mock` — use the canned mock API (mock-api.sh)
+- `--dry-run` — print the exact curl command, do not execute
+- `--endpoint URL` — override PANGOLIN_API_ENDPOINT
+- `--org ID` — override PANGOLIN_ORG_ID
+- `--timeout N` — probe timeout in seconds (default 5)
+- `--verbose` — show detailed progress output
+
+### Prerequisites
+
+- **pangolin CLI**: Required for live test mode. Install with:
+  `curl -fsSL https://static.pangolin.net/get-cli.sh | bash`
+- **WireGuard kernel module**: Required for tunnel establishment. Check with `lsmod | grep wireguard`.
+
+### Notes
+
+- Client delete is NOT in the Integration API. `delete` is best-effort.
+- Secret is only known at creation time — `test` creates its own client.
+- Follows same conventions as `pango`: bash + curl + jq, same `.env` auth.
+- Exit codes: 1 = API/env error, 2 = usage error.
+- `.mock-state.json` persists created clients across runs.
+
+## User's NEWT issue (out of scope)
+
+4 NEWT sites fail to connect — suspected newtId/secret key mismatch. This is a
+tunnel-pairing problem, NOT visible via the Integration API. Fix path when API is
+live: `create-site --from-defaults` (picks newtId/secret via `pick-site-defaults`).
