@@ -103,14 +103,11 @@ save_state() { # <new-state-json>
 # --- handlers ---------------------------------------------------------------
 list_entities() { # <entity-key> <status-message>
   local key="$1" msg="$2" ps pg off data
-  # Accept both pageSize/page and limit/offset pagination styles
   ps="$(qparam pageSize 0)"; [[ "$ps" == "0" ]] && ps="$(qparam limit 1000)"
   pg="$(qparam page 0)";     [[ "$pg" == "0" ]] && pg=1
   off="$(qparam offset 0)"
   # Convert limit/offset to pageSize/page for the jq slice
-  if [[ "$off" -gt 0 ]]; then
-    pg=$(( off / ps + 1 ))
-  fi
+  if [[ "$off" -gt 0 ]]; then pg=$(( off / ps + 1 )); fi
   data="$(jq -c --arg key "$key" --argjson ps "$ps" --argjson pg "$pg" \
     '.[$key] as $all | {($key): $all[(($pg-1)*$ps):(($pg-1)*$ps + $ps)], pagination: {total: ($all | length), pageSize: $ps, page: $pg}}' \
     "$STATE_FILE")"
@@ -236,7 +233,6 @@ apply_blueprint() {
 }
 
 # --- healthcheck handlers -----------------------------------------------------
-
 list_health_checks() { # GET /org/{orgId}/health-checks
   local ps pg off data
   ps="$(qparam pageSize 0)"; [[ "$ps" == "0" ]] && ps="$(qparam limit 1000)"
@@ -286,7 +282,7 @@ update_health_check() {
     envelope 'null' false true 'body must be a valid JSON object' 400; exit 0
   fi
   local state
-  state="$(jq --argjson id "$hcId" --argjson body "$(jq 'del(.healthCheckId)' <<<"$BODY")'" '.healthchecks |= map(if .healthCheckId == $id then ( . + $body ) else . end)' "$STATE_FILE")"
+  state="$(jq --argjson id "$hcId" --argjson body "$(jq 'del(.healthCheckId)' <<<"$BODY")" '.healthchecks |= map(if .healthCheckId == $id then ( . + $body ) else . end)' "$STATE_FILE")"
   save_state "$state"
   data="$(jq -c --argjson id "$hcId" '.healthchecks[] | select(.healthCheckId == $id)' "$STATE_FILE")"
   envelope "$data" true false "Health check updated successfully" 200
@@ -317,6 +313,52 @@ get_health_check_status_history() { # GET /org/{orgId}/health-check/{healthCheck
   envelope "$data" true false "Health check status history retrieved successfully" 200
 }
 
+# --- client handlers ------------------------------------------------------
+create_client() {
+  local name type olmId secret subnet data newid state
+  name="$(jq -r '.name // empty' <<<"$BODY")"
+  type="$(jq -r '.type // "olm"' <<<"$BODY")"
+  olmId="$(jq -r '.olmId // empty' <<<"$BODY")"
+  secret="$(jq -r '.secret // empty' <<<"$BODY")"
+  subnet="$(jq -r '.subnet // empty' <<<"$BODY")"
+  [[ -n "$name" ]] || { envelope 'null' false true 'name is required' 400; exit 0; }
+  maxid="$(jq '[.clients[].clientId] | max // 0' "$STATE_FILE")"
+  newid=$((maxid + 1))
+  [[ -n "$olmId" ]] || { olmId="clientolm${newid}"; }
+  [[ -n "$secret" ]] || { secret="mocksecret${newid}"; }
+  [[ -n "$subnet" ]] || { subnet="100.0.0.${newid}/24"; }
+  state="$(jq --argjson id "$newid" --arg name "$name" --arg type "$type" \
+    --arg olmId "$olmId" --arg secret "$secret" --arg subnet "$subnet" \
+    '.clients += [{clientId:$id, name:$name, type:$type, olmId:$olmId, secret:$secret, subnet:$subnet, online:false}]' \
+    "$STATE_FILE")"
+  save_state "$state"
+  data="$(jq -n --argjson id "$newid" --arg name "$name" --arg type "$type" \
+    --arg olmId "$olmId" --arg secret "$secret" --arg subnet "$subnet" \
+    '{clientId:$id, name:$name, type:$type, olmId:$olmId, secret:$secret, subnet:$subnet, online:false}')"
+  envelope "$data" true false "Client created successfully" 201
+}
+
+get_client() {
+  local cid data
+  cid="$(sed -E 's#.*/([0-9]+)$#\1#' <<<"$PATH_ARG")"
+  data="$(jq -c --argjson id "$cid" '.clients[] | select(.clientId == $id)' "$STATE_FILE")"
+  if [[ "$(jq 'length' <<<"$data")" -eq 0 ]]; then
+    envelope 'null' false true "Client not found: $cid" 404; exit 0
+  fi
+  envelope "$data" true false "Client retrieved successfully" 200
+}
+
+delete_client() {
+  local cid data state
+  cid="$(sed -E 's#.*/([0-9]+)$#\1#' <<<"$PATH_ARG")"
+  if ! jq -e --argjson id "$cid" '.clients[] | select(.clientId == $id)' "$STATE_FILE" >/dev/null 2>&1; then
+    envelope 'null' false true "Client not found: $cid" 404; exit 0
+  fi
+  state="$(jq --argjson id "$cid" '.clients = [.clients[] | select(.clientId != $id)]' "$STATE_FILE")"
+  save_state "$state"
+  envelope 'null' true false "Client deleted successfully" 200
+}
+
 # --- router -----------------------------------------------------------------
 main() {
   ensure_state
@@ -328,7 +370,7 @@ main() {
     envelope 'null' false true "Internal server error (simulated)" 500
     exit 0
   fi
-  case "$METHOD $PATH_ARG" in
+                case "$METHOD $PATH_ARG" in
     "GET /org/"*"/sites")               list_entities sites "Sites retrieved successfully" ;;
     "GET /org/"*"/resources")           list_entities resources "Resources retrieved successfully" ;;
     "GET /org/"*"/domains")             list_entities domains "Domains retrieved successfully" ;;
@@ -348,10 +390,15 @@ main() {
     "PUT /org/"*"/health-check")      create_health_check ;;
     "POST /org/"*"/health-check/"*"") update_health_check ;;
     "DELETE /org/"*"/health-check/"*"") delete_health_check ;;
+    "GET /client/"*)             get_client ;;
+    "PUT /org/"*"/client")             create_client ;;
+    "DELETE /client/"*)             delete_client ;;
+    "DELETE /org/"*"/client/"*"") delete_client ;;
     *)
       envelope 'null' false true "Not found: $METHOD $PATH_ARG" 404
       ;;
-  esac
+esac
+
 }
 
 main "$@"
