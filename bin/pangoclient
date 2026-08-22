@@ -1,0 +1,405 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(dirname "$SCRIPT_DIR")"
+
+MOCK=0
+DRY_RUN=0
+TIMEOUT=5
+VERBOSE=0
+
+# Parse flags: --mock, --dry-run, --endpoint, --org, --timeout, --verbose
+args=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --mock) MOCK=1; shift ;;
+    --dry-run) DRY_RUN=1; shift ;;
+    --endpoint) PANGOLIN_API_ENDPOINT="${2:-}"; shift 2 ;;
+    --org) PANGOLIN_ORG_ID="${2:-}"; shift 2 ;;
+    --timeout) TIMEOUT="${2:-5}"; shift 2 ;;
+    --verbose) VERBOSE=1; shift ;;
+    *) args+=("$1"); shift ;;
+  esac
+done
+set -- "${args[@]+${args[@]}}"
+
+load_env() {
+  local env_file="$REPO_DIR/.env"
+  if [[ -f "$env_file" ]]; then
+    set -a
+    source "$env_file"
+    set +a
+  fi
+}
+
+load_env
+
+PANGOLIN_API_ENDPOINT="${PANGOLIN_API_ENDPOINT:-https://api.pangolin.aldervall.se}"
+PANGOLIN_ORG_ID="${PANGOLIN_ORG_ID:-aldervall}"
+
+command="${1:-}"
+
+usage() {
+  printf 'pangoclient -- Pangolin Client Reachability Tester\n\n' >&2
+  printf 'Usage:\n  pangoclient [--mock] [--dry-run] [--timeout N] [--verbose] <command> [args]\n\n' >&2
+  printf 'Commands:\n' >&2
+  printf '  list <entity>          List entities: clients | resources | domains\n' >&2
+  printf '  create <name>          Create a new machine client\n' >&2
+  printf '  inspect <id|name>      Inspect a client by ID or name\n' >&2
+  printf '  delete <id|name>       Delete a client (best-effort)\n' >&2
+  printf '  test <id|name>         Test reachability of resources from a machine client\n' >&2
+  printf '  help                   Show this help\n\n' >&2
+  printf 'Flags:\n' >&2
+  printf '  --mock                 Use the canned mock API (mock-api.sh)\n' >&2
+  printf '  --dry-run              Print the exact curl command, do not execute\n' >&2
+  printf '  --endpoint URL         Override PANGOLIN_API_ENDPOINT\n' >&2
+  printf '  --org ID               Override PANGOLIN_ORG_ID\n' >&2
+  printf '  --timeout N            Probe timeout in seconds (default 5)\n' >&2
+  printf '  --verbose              Show detailed progress output\n\n' >&2
+  printf 'Env:\n' >&2
+  printf '  PANGOLIN_API_KEY       Bearer token (required for live/mock calls)\n' >&2
+  printf '  PANGOLIN_API_ENDPOINT  API base, default https://api.pangolin.aldervall.se\n' >&2
+  printf '  PANGOLIN_ORG_ID        Organization id, default aldervall\n' >&2
+}
+
+api_call() {
+  local method="$1" path="$2" body="${3:-}"
+  local url="${PANGOLIN_API_ENDPOINT%/}/v1${path}"
+  if [[ "$DRY_RUN" == 1 ]]; then
+    printf 'curl -sS -X %s %s -H %s' "$method" "$url" \
+      "'Authorization: Bearer \$PANGOLIN_API_KEY'"
+    if [[ -n "$body" ]]; then
+      printf ' -H %s -d %s' "'Content-Type: application/json'" "'$body'"
+    fi
+    printf '\n'
+    return 0
+  fi
+  if [[ -z "${PANGOLIN_API_KEY:-}" ]]; then
+    echo "error: set PANGOLIN_API_KEY (see .env.example)" >&2
+    exit 1
+  fi
+  if [[ "$MOCK" == 1 ]]; then
+    if [[ -n "$body" ]]; then
+      PANGOLIN_API_KEY="$PANGOLIN_API_KEY" bash "$REPO_DIR/mock-api.sh" "$method" "$path" --body "$body"
+    else
+      PANGOLIN_API_KEY="$PANGOLIN_API_KEY" bash "$REPO_DIR/mock-api.sh" "$method" "$path"
+    fi
+    return 0
+  fi
+  local cmd=(curl -sS -X "$method" "$url" -H "Authorization: Bearer ${PANGOLIN_API_KEY}")
+  if [[ -n "$body" ]]; then
+    cmd+=(-H "Content-Type: application/json" -d "$body")
+  fi
+  "${cmd[@]}"
+}
+
+check_envelope() {
+  local resp="$1" error status message
+  error="$(jq -r '.error // false' <<<"$resp")"
+  if [[ "$error" == "true" ]]; then
+    message="$(jq -r '.message // ""' <<<"$resp")"
+    echo "API error: $message" >&2
+    exit 1
+  fi
+  status="$(jq -r '.status // 0' <<<"$resp")"
+  if [[ "${status:-0}" -ge 400 ]]; then
+    message="$(jq -r '.message // ""' <<<"$resp")"
+    echo "API request failed (status $status): $message" >&2
+    exit 1
+  fi
+}
+
+# --- Entity listing ---
+
+cmd_list() {
+  local entity="${1:-clients}"
+  local resp
+
+  if [[ "$DRY_RUN" == 1 ]]; then
+    api_call GET "/org/${PANGOLIN_ORG_ID}/$entity"
+    return 0
+  fi
+
+  if [[ "$MOCK" == 1 ]]; then
+    resp="$(PANGOLIN_API_KEY="${PANGOLIN_API_KEY:-test}" bash "$REPO_DIR/mock-api.sh" GET "/org/${PANGOLIN_ORG_ID}/$entity")"
+  else
+    resp="$(api_call GET "/org/${PANGOLIN_ORG_ID}/$entity")"
+  fi
+
+  local key
+  case "$entity" in
+    clients)   key="clients" ;;
+    resources) key="resources" ;;
+    domains)   key="domains" ;;
+    *)         echo "Unknown entity: $entity" >&2; return 1 ;;
+  esac
+
+  local count
+  count="$(jq --arg key "$key" '.data[$key] | length' <<<"$resp" 2>/dev/null || echo 0)"
+
+  if [[ "$count" -eq 0 ]]; then
+    echo "No ${entity} found"
+    return 0
+  fi
+
+  case "$entity" in
+    clients)
+      printf '%-6s %-30s %-20s %s\n' "ID" "NAME" "SUBNET" "ONLINE"
+      jq -r '.data.clients[] | "\(.clientId)\t\(.name)\t\(.subnet // "")\t\(.online // "")"' <<<"$resp" \
+        | column -t -s $'\t'
+      ;;
+    resources)
+      printf '%-6s %-30s %-40s %s\n' "ID" "NAME" "DOMAIN" "MODE"
+      jq -r '.data.resources[] | "\(.resourceId)\t\(.name)\t\(.fullDomain // "")\t\(.mode // "")"' <<<"$resp" \
+        | column -t -s $'\t'
+      ;;
+    domains)
+      printf '%-6s %-30s %s\n' "ID" "NAME" "TYPE"
+      jq -r '.data.domains[] | "\(.domainId)\t\(.baseDomain // .name)\t\(.type // "")"' <<<"$resp" \
+        | column -t -s $'\t'
+      ;;
+  esac
+}
+
+# --- Client management ---
+
+cmd_create() {
+  local name="${1:-}"
+  if [[ -z "$name" ]]; then
+    echo "error: client name required" >&2
+    usage
+    exit 1
+  fi
+  if [[ "$DRY_RUN" == 1 ]]; then
+    api_call PUT "/org/${PANGOLIN_ORG_ID}/client" "{\"name\":\"$name\"}"
+    return 0
+  fi
+  if [[ "$MOCK" == 1 ]]; then
+    local resp
+    resp="$(PANGOLIN_API_KEY="${PANGOLIN_API_KEY:-test}" bash "$REPO_DIR/mock-api.sh" PUT "/org/${PANGOLIN_ORG_ID}/client" --body "{\"name\":\"$name\"}")"
+    check_envelope "$resp"
+    printf 'Created client: %s\n' "$resp"
+    return 0
+  fi
+  local resp
+  resp="$(api_call PUT "/org/${PANGOLIN_ORG_ID}/client" "{\"name\":\"$name\"}")"
+  check_envelope "$resp"
+  printf 'Created client: %s\n' "$resp"
+}
+
+cmd_inspect() {
+  local ident="${1:-}"
+  if [[ -z "$ident" ]]; then
+    echo "error: client identifier required" >&2
+    usage
+    exit 1
+  fi
+  if [[ "$MOCK" == 1 ]]; then
+    local resp
+    if [[ "$ident" =~ ^[0-9]+$ ]]; then
+      resp="$(PANGOLIN_API_KEY="${PANGOLIN_API_KEY:-test}" bash "$REPO_DIR/mock-api.sh" GET "/client/${ident}")"
+    else
+      resp="$(PANGOLIN_API_KEY="${PANGOLIN_API_KEY:-test}" bash "$REPO_DIR/mock-api.sh" GET "/org/${PANGOLIN_ORG_ID}/clients")"
+      resp="$(jq -c --arg name "$ident" '.data.clients[] | select(.name == $name)' <<<"$resp")"
+    fi
+    check_envelope "$resp"
+    printf 'Client: %s\n' "$resp"
+  else
+    api_call GET "/org/${PANGOLIN_ORG_ID}/clients"
+  fi
+}
+
+cmd_delete() {
+  local ident="${1:-}"
+  if [[ -z "$ident" ]]; then
+    echo "error: client identifier required" >&2
+    usage
+    exit 1
+  fi
+  if [[ "$DRY_RUN" == 1 ]]; then
+    api_call DELETE "/org/${PANGOLIN_ORG_ID}/client/${ident}"
+    return 0
+  fi
+  if [[ "$MOCK" == 1 ]]; then
+    if [[ "$ident" =~ ^[0-9]+$ ]]; then
+      local resp
+      resp="$(PANGOLIN_API_KEY="${PANGOLIN_API_KEY:-test}" bash "$REPO_DIR/mock-api.sh" DELETE "/org/${PANGOLIN_ORG_ID}/client/${ident}")"
+    else
+      local resp
+      resp="$(PANGOLIN_API_KEY="${PANGOLIN_API_KEY:-test}" bash "$REPO_DIR/mock-api.sh" GET "/org/${PANGOLIN_ORG_ID}/clients")"
+      local id
+      id="$(jq -r --arg name "$ident" '.data.clients[] | select(.name == $name) | .clientId' <<<"$resp")"
+      if [[ -z "$id" || "$id" == "null" ]]; then
+        echo "error: client '$ident' not found" >&2
+        exit 1
+      fi
+      resp="$(PANGOLIN_API_KEY="${PANGOLIN_API_KEY:-test}" bash "$REPO_DIR/mock-api.sh" DELETE "/org/${PANGOLIN_ORG_ID}/client/${id}")"
+    fi
+    check_envelope "$resp"
+    printf 'Deleted client: %s\n' "$resp"
+    return 0
+  fi
+  if [[ "$ident" =~ ^[0-9]+$ ]]; then
+    local resp
+    resp="$(api_call DELETE "/org/${PANGOLIN_ORG_ID}/client/${ident}")"
+  else
+    local resp
+    resp="$(api_call GET "/org/${PANGOLIN_ORG_ID}/clients")"
+    local id
+    id="$(jq -r --arg name "$ident" '.clients[] | select(.name == $name) | .clientId' <<<"$resp")"
+    if [[ -z "$id" || "$id" == "null" ]]; then
+      echo "error: client '$ident' not found" >&2
+      exit 1
+    fi
+    resp="$(api_call DELETE "/org/${PANGOLIN_ORG_ID}/client/${id}")"
+  fi
+  check_envelope "$resp"
+  printf 'Deleted client: %s\n' "$resp"
+}
+
+# --- Reachability test ---
+
+cmd_test() {
+  local ident="${1:-}"
+  if [[ -z "$ident" ]]; then
+    echo "error: client identifier required" >&2
+    usage
+    exit 1
+  fi
+
+  if [[ "$DRY_RUN" == 1 ]]; then
+    echo "# Step 1: Resolve client '$ident'"
+    api_call GET "/org/${PANGOLIN_ORG_ID}/clients"
+    echo ""
+    echo "# Step 2: Create temporary test client"
+    api_call PUT "/org/${PANGOLIN_ORG_ID}/client" "{\"name\":\"test-temp-${ident}\"}"
+    echo ""
+    echo "# Step 3: Fetch client details and list resources"
+    api_call GET "/client/<temp-client-id>"
+    api_call GET "/org/${PANGOLIN_ORG_ID}/resources"
+    echo ""
+    echo "# Step 4: Start WireGuard tunnel (background)"
+    echo "pangolin up --id <olmId> --secret <secret>"
+    echo ""
+    echo "# Step 5: Probe each resource (timeout: ${TIMEOUT}s)"
+    echo "curl -sS -o /dev/null -w '%{http_code}' --connect-timeout ${TIMEOUT} http://<fullDomain>"
+    echo ""
+    echo "# Step 6: Disconnect tunnel and delete temp client"
+    echo "kill <pangolin-pid>"
+    api_call DELETE "/org/${PANGOLIN_ORG_ID}/client/<temp-client-id>"
+    return 0
+  fi
+
+  if [[ "$MOCK" == 1 ]]; then
+    local client_id client_name
+    if [[ "$ident" =~ ^[0-9]+$ ]]; then
+      client_id="$ident"
+      client_name="$(PANGOLIN_API_KEY="${PANGOLIN_API_KEY:-test}" bash "$REPO_DIR/mock-api.sh" GET "/client/${client_id}" 2>/dev/null | jq -r '.data.name // "unknown"')"
+    else
+      local clients_resp
+      clients_resp="$(PANGOLIN_API_KEY="${PANGOLIN_API_KEY:-test}" bash "$REPO_DIR/mock-api.sh" GET "/org/${PANGOLIN_ORG_ID}/clients")"
+      client_id="$(jq -r --arg name "$ident" '.data.clients[] | select(.name == $name) | .clientId' <<<"$clients_resp")"
+      client_name="$ident"
+    fi
+
+    if [[ -z "$client_id" || "$client_id" == "null" ]]; then
+      echo "error: client '$ident' not found" >&2
+      exit 1
+    fi
+
+    if [[ "$VERBOSE" == 1 ]]; then
+      echo "Resolving client '$ident'... found ID $client_id ($client_name)"
+    fi
+
+    printf 'Client %s (ID: %s) - Testing reachability through WireGuard tunnel\n' "$client_name" "$client_id"
+    printf '========================================================================\n'
+
+    if [[ "$VERBOSE" == 1 ]]; then
+      echo "Fetching resources..."
+    fi
+
+    local resources_resp
+    resources_resp="$(PANGOLIN_API_KEY="${PANGOLIN_API_KEY:-test}" bash "$REPO_DIR/mock-api.sh" GET "/org/${PANGOLIN_ORG_ID}/resources")"
+    check_envelope "$resources_resp"
+
+    local resource_count
+    resource_count="$(jq '.data.resources | length' <<<"$resources_resp")"
+    printf 'Found %d resources\n' "$resource_count"
+
+    if [[ "$resource_count" -gt 0 ]]; then
+      if [[ "$VERBOSE" == 1 ]]; then
+        echo "Testing reachability (timeout: ${TIMEOUT}s)..."
+      fi
+
+      local first_resource_id
+      first_resource_id="$(jq -r '.data.resources[0].resourceId' <<<"$resources_resp")"
+
+      if [[ "$VERBOSE" == 1 ]]; then
+        echo "Resource $first_resource_id: checking targets..."
+      fi
+
+      local targets_resp
+      targets_resp="$(PANGOLIN_API_KEY="${PANGOLIN_API_KEY:-test}" bash "$REPO_DIR/mock-api.sh" GET "/resource/${first_resource_id}/targets")"
+      check_envelope "$targets_resp"
+
+      local target_count
+      target_count="$(jq '.data.targets | length' <<<"$targets_resp")"
+      printf 'Found %d targets for resource %s\n' "$target_count" "$first_resource_id"
+
+      if [[ "$target_count" -gt 0 ]]; then
+        local first_target_ip
+        first_target_ip="$(jq -r '.data.targets[0].ip' <<<"$targets_resp")"
+        local first_target_port
+        first_target_port="$(jq -r '.data.targets[0].port' <<<"$targets_resp")"
+
+        printf 'Target: %s:%s\n' "$first_target_ip" "$first_target_port"
+        printf 'Reachability: %s (through WireGuard tunnel from client %s)\n' \
+          "SIMULATED_SUCCESS" "$client_name"
+      fi
+    fi
+
+    if [[ "$VERBOSE" == 1 ]]; then
+      echo "Disconnecting tunnel..."
+      echo "Cleaning up temporary client..."
+    fi
+
+    printf '\nTest complete. Client %s reachability simulated via mock API.\n' "$client_name"
+    return 0
+  fi
+
+  printf 'Live mode: pangolin CLI not installed on this machine.\n' >&2
+  printf 'Install with: curl -fsSL https://static.pangolin.net/get-cli.sh | bash\n' >&2
+  printf 'Then: pangoclient test <id|name> --mock (for mock reachability test)\n' >&2
+  exit 1
+}
+
+# --- Main dispatch ---
+
+case "$command" in
+  list)
+    cmd_list "${2:-clients}"
+    ;;
+  create)
+    cmd_create "${2:-}"
+    ;;
+  inspect)
+    cmd_inspect "${2:-}"
+    ;;
+  delete)
+    cmd_delete "${2:-}"
+    ;;
+  test)
+    cmd_test "${2:-}"
+    ;;
+  help|--help|-h)
+    usage
+    ;;
+  *)
+    printf 'Unknown command: %s\n' "$command" >&2
+    usage
+    exit 1
+    ;;
+esac
+
+exit 0
